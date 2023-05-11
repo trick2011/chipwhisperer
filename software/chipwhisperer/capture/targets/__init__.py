@@ -39,6 +39,7 @@ from .CW305_AES import CW305_AES
 from .CW305_ECC import CW305_ECC
 from .CW305_Kyber import CW305_Kyber
 from .CW305_Kyber_decr import CW305_Kyber_decr
+from .CW305_Kyber_decaps import CW305_Kyber_decaps
 from .CW310 import CW310
 from typing import Union
 
@@ -49,5 +50,5 @@ except ImportError:
 
 # from .SmartCard import SmartCard #Tied to GUI
 SimpleSerialTypes = Union[SimpleSerial, SimpleSerial2, SimpleSerial2_CDC]
-FPGATypes = Union[CW305, CW305_AES, CW305_ECC, CW305_Kyber, CW305_Kyber_decr, CW310]
+FPGATypes = Union[CW305, CW305_AES, CW305_ECC, CW305_Kyber, CW305_Kyber_decr, CW305_Kyber_decaps, CW310]
 TargetTypes = Union[FPGATypes, SimpleSerialTypes]

@@ -113,15 +113,15 @@ class Project(Parameterized):
     Use a trace_manager when analyzing traces, since that allows analyzer to
     work with multiple trace segments.
 
-      *  :attr:`project.location <.Project.location>`
-      *  :attr:`project.waves <.Project.waves>`
-      *  :attr:`project.textins <.Project.textins>`
-      *  :attr:`project.textouts <.Project.textouts>`
-      *  :attr:`project.keys <.Project.keys>`
-      *  :meth:`project.get_filename <.Project.get_filename>`
-      *  :meth:`project.trace_manager <.Project.trace_manager>`
-      *  :meth:`project.save <.Project.save>`
-      *  :meth:`project.export <.Project.export>`
+    *  :attr:`project.location <.Project.location>`
+    *  :attr:`project.waves <.Project.waves>`
+    *  :attr:`project.textins <.Project.textins>`
+    *  :attr:`project.textouts <.Project.textouts>`
+    *  :attr:`project.keys <.Project.keys>`
+    *  :meth:`project.get_filename <.Project.get_filename>`
+    *  :meth:`project.trace_manager <.Project.trace_manager>`
+    *  :meth:`project.save <.Project.save>`
+    *  :meth:`project.export <.Project.export>`
     """
     untitledFileName = os.path.normpath(os.path.join(Settings().value("project-home-dir"), "tmp", "default.cwp"))
 
@@ -673,7 +673,7 @@ class Traces:
         """Append a Trace containing the trace and related operation information.
 
         Args:
-            trace (:class:`Trace <chipwhisperer.common.trace.Trace>`): A captured or created trace.
+            trace (:class:`Trace <chipwhisperer.common.traces.Trace>`): A captured or created trace.
             dtype: Numpy data type for storing trace.wave
 
         Raises:
@@ -694,7 +694,7 @@ class Traces:
         """Add all traces in an iterable to the project.
 
         Args:
-            iterable: Any iterable of :class:`Trace <chipwhisperer.common.trace.Trace>` objects.
+            iterable: Any iterable of :class:`Trace <chipwhisperer.common.traces.Trace>` objects.
 
         Raises:
             TypeError: If any of the object in the iterable are not a trace.

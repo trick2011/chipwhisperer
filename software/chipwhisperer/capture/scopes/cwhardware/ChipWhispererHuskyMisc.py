@@ -24,8 +24,8 @@
 #    You should have received a copy of the GNU General Public License
 #    along with chipwhisperer.  If not, see <http://www.gnu.org/licenses/>.
 #=================================================
-from collections import OrderedDict
 from ....common.utils import util
+from ...api.cwcommon import ChipWhispererSAMErrors
 from .. import _OpenADCInterface as OAI
 
 from ....logging import *
@@ -34,38 +34,6 @@ import time
 
 CODE_READ = 0x80
 CODE_WRITE = 0xC0
-
-ADDR_LED_SELECT         = 34
-
-ADDR_XADC_DRP_ADDR      = 41
-ADDR_XADC_DRP_DATA      = 42
-ADDR_XADC_STAT          = 43
-
-ADDR_NO_CLIP_ERRORS     = 45
-
-ADDR_HUSKY_ADC_CTRL     = 60
-
-ADDR_LA_DRP_ADDR        = 68
-ADDR_LA_DRP_DATA        = 69
-ADDR_LA_STATUS          = 70
-ADDR_LA_CLOCK_SOURCE    = 71
-ADDR_LA_TRIGGER_SOURCE  = 72
-ADDR_LA_POWERDOWN       = 73
-ADDR_LA_DRP_RESET       = 74
-ADDR_LA_MANUAL_CAPTURE  = 75
-ADDR_COMPONENTS_EXIST   = 96
-ADDR_LA_CAPTURE_GROUP   = 76
-ADDR_LA_CAPTURE_DEPTH   = 77
-ADDR_LA_DOWNSAMPLE      = 78
-ADDR_LA_ARM             = 98
-ADDR_LA_ENABLED         = 99
-
-ADDR_USERIO_CW_DRIVEN   = 86
-ADDR_USERIO_DEBUG_DRIVEN= 87
-ADDR_USERIO_DRIVE_DATA  = 88
-ADDR_USERIO_READ        = 97
-ADDR_TRACE_EN           = 0xc0 + 0x2d
-
 
 class XilinxDRP(util.DisableNewAttr):
     ''' Read/write methods for DRP port in Xilinx primitives such as MMCM and XADC.
@@ -83,6 +51,7 @@ class XilinxDRP(util.DisableNewAttr):
 
     def write(self, addr, data):
         """Write DRP register. UG480 for register definitions.
+
         Args:
             addr (int): 6-bit address
             data (int): 16-bit write data
@@ -92,8 +61,10 @@ class XilinxDRP(util.DisableNewAttr):
 
     def read(self, addr):
         """Read DRP register. UG480 for register definitions.
+
         Args:
             addr (int): 6-bit address
+
         Returns:
             A 16-bit integer.
         """
@@ -130,7 +101,7 @@ class XilinxMMCMDRP(util.DisableNewAttr):
         else:
             hi = lo
         if hi >= 2**6:
-            raise ValueError("Internal error: calculated hi/lo value exceeding range")
+            raise ValueError("MMCM internal error: calculated hi/lo value exceeding range")
         raw = lo + (hi<<6) + 0x1000
         self.drp.write(0x14, raw)
         self.drp.reset()
@@ -253,7 +224,7 @@ class XilinxMMCMDRP(util.DisableNewAttr):
 
 
 class LEDSettings(util.DisableNewAttr):
-    ''' Set source of Husky front-panel LEDs
+    ''' Set source of Husky front-panel LEDs.
     '''
     _name = 'Husky LEDs Setting'
 
@@ -263,7 +234,7 @@ class LEDSettings(util.DisableNewAttr):
         self.disable_newattr()
 
     def _dict_repr(self):
-        rtn = OrderedDict()
+        rtn = {}
         rtn['setting'] = self.setting
         return rtn
 
@@ -289,7 +260,7 @@ class LEDSettings(util.DisableNewAttr):
         be updated to account for this).
 
         """
-        raw = self.oa.sendMessage(CODE_READ, ADDR_LED_SELECT, maxResp=1)[0]
+        raw = self.oa.sendMessage(CODE_READ, "LED_SELECT", maxResp=1)[0]
         if raw == 0:   return "0 (default, as labelled)"
         elif raw == 1: return "1 (USB and CLKGEN clock heartbeats)"
         elif raw == 2: return "2 (ADC clock heartbeats)"
@@ -300,17 +271,18 @@ class LEDSettings(util.DisableNewAttr):
     def setting(self, val):
         if val < 0 or val > 3:
             raise ValueError
-        self.oa.sendMessage(CODE_WRITE, ADDR_LED_SELECT, [val])
+        self.oa.sendMessage(CODE_WRITE, "LED_SELECT", [val])
 
 
-class HuskyErrors(util.DisableNewAttr):
+class HuskyErrors(ChipWhispererSAMErrors):
     ''' Gather all the Husky error sources in one place.
         Use scope.errors.clear() to clear them.
     '''
     _name = 'Husky Errors'
 
     def __init__(self, oaiface : OAI.OpenADCInterface, XADC, adc, clock, trace):
-        super().__init__()
+        super().__init__(oaiface.serial) # naeusb comms
+        self.enable_newattr()
         self.oa = oaiface
         self.XADC = XADC
         self.adc = adc
@@ -319,7 +291,7 @@ class HuskyErrors(util.DisableNewAttr):
         self.disable_newattr()
 
     def _dict_repr(self):
-        rtn = OrderedDict()
+        rtn = super()._dict_repr()
         rtn['XADC errors'] = self.XADC.errors()
         rtn['ADC errors'] = self.adc.errors
         rtn['extclk error'] = self.clock.extclk_error
@@ -333,6 +305,7 @@ class HuskyErrors(util.DisableNewAttr):
         return self.__repr__()
 
     def clear(self):
+        super().clear()
         self.XADC.status = 0
         self.adc.errors = 0
         self.clock.extclk_error = 0
@@ -344,17 +317,239 @@ class USERIOSettings(util.DisableNewAttr):
     '''
     _name = 'USERIO Control'
 
-    def __init__(self, oaiface : OAI.OpenADCInterface):
+    fpga_mode_definitions = [None]*16 # type: list
+
+    # fpga_mode = 0:
+    fpga_mode_definitions[0] = ['streaming debug',
+                                 ['stream_segment_available',
+                                  'slow_fifo_wr_slow',
+                                  'slow_fifo_rd_slow',
+                                  'reg_read_slow',
+                                  'fast_fifo_read',
+                                  'fifo_error_flag',
+                                  'glitchclk',
+                                  'glitch_enable',
+                                  'unused']]
+
+    # fpga_mode = 1:
+    fpga_mode_definitions[1] = ['trigger_unit.v debug', 
+                                  ['cmd_arm_usb',
+                                   'trigger',
+                                   'armed',
+                                   'capture_active_o',
+                                   'capture_done_i',
+                                   'int_reset_capture',
+                                   'arm_o',
+                                   'armed_and_ready',
+                                   'adc_capture_done']]
+
+    # fpga_mode = 2:
+    fpga_mode_definitions[2] = ['fifo_top_husky.v debug', 
+                                 ['state[0]',
+                                  'state[1]',
+                                  'state[2]',
+                                  'capture_go',
+                                  'arming',
+                                  'armed_and_ready',
+                                  'fifo_rst',
+                                  'adc_capture_stop',
+                                  'unused']]
+
+    # fpga_mode = 3:
+    fpga_mode_definitions[3] = ['glitch debug', 
+                                 ['cmd_arm_usb',
+                                  'trigger_capture',
+                                  'glitch_enable',
+                                  'glitchclk',
+                                  'glitch_mmcm2_clk_out',
+                                  'glitch_mmcm1_clk_out',
+                                  'xadc_error_flag',
+                                  'unused',
+                                  'unused']]
+
+    # fpga_mode = 4:
+    fpga_mode_definitions[4] = ['clockglitch debug1', 
+                                 ['exttrigger',
+                                  'exttrigger_resync',
+                                  'trigger_resync_idle',
+                                  'glitch_trigger',
+                                  'glitch_done_count[0]',
+                                  'glitch_done_count[1]',
+                                  'clockglitch_count[0]',
+                                  'clockglitch_count[1]',
+                                  'unused']]
+
+    # fpga_mode = 5:
+    fpga_mode_definitions[5] = ['clockglitch debug2', 
+                                 ['glitch_done_count[1]',
+                                  'glitch_done_count[0]',
+                                  'glitch_enable',
+                                  'glitchclk',
+                                  'glitch_trigger',
+                                  'glitch_mmcm1_clk_out',
+                                  'sourceclk',
+                                  'exttrigger',
+                                  'unused']]
+
+    # fpga_mode = 6:
+    fpga_mode_definitions[6] = ['usb debug1', 
+                                 ['USB_Data[4]',
+                                  'USB_Data[5]',
+                                  'USB_Data[6]',
+                                  'USB_Data[7]',
+                                  'clk_usb_buf',
+                                  'USB_CEn',
+                                  'USB_WRn',
+                                  'USB_RDn',
+                                  'unused']]
+
+    # fpga_mode = 7:
+    fpga_mode_definitions[7] = ['usb debug2', 
+                                 ['USB_Data[0]',
+                                  'USB_Data[1]',
+                                  'USB_Data[2]',
+                                  'USB_Data[3]',
+                                  'clk_usb_buf',
+                                  'USB_CEn',
+                                  'USB_WRn',
+                                  'USB_RDn',
+                                  'unused']]
+
+    # fpga_mode = 8:
+    fpga_mode_definitions[8] = ['usb debug3', 
+                                 ['USB_Data[0]',
+                                  'USB_Data[1]',
+                                  'USB_Data[2]',
+                                  'USB_Data[3]',
+                                  'USB_Data[4]',
+                                  'USB_Data[5]',
+                                  'USB_Data[6]',
+                                  'reg_write',
+                                  'unused']]
+
+    # fpga_mode = 9:
+    fpga_mode_definitions[9] = ['edge trigger debug', 
+                                 ['trigger_in',
+                                  'trigger_in_r[0]',
+                                  'trigger_in_r[1]',
+                                  'triggered',
+                                  'armed_and_ready',
+                                  'running',
+                                  'edge_counter[0]',
+                                  'edge_counter[1]',
+                                  'unused']]
+
+    # fpga_mode = 10:
+    fpga_mode_definitions[10] = ['clockglitch debug3 (trigger_resync)', 
+                                 ['exttrig',
+                                  'exttrigger_resync',
+                                  'async_trigger',
+                                  'state[0]',
+                                  'state[1]',
+                                  'done',
+                                  'oneshot',
+                                  'glitch_condition',
+                                  'unused']]
+
+    # fpga_mode = 11:
+    fpga_mode_definitions[11] = ['triggers',
+                                 ['cmd_arm_usb',
+                                  'trigger_edge_counter',
+                                  'trigger_adc',
+                                  'trace_trig_out',
+                                  'trigger_sad',
+                                  'uart_trigger_line',
+                                  'target_io4',
+                                  'edge_trigger_line',
+                                  'unused']]
+
+    # fpga_mode = 12:
+    fpga_mode_definitions[12] = ['trigger_unit.v debug2',
+                                 ['arm_i',
+                                  'adc_capture_done',
+                                  'trigger',
+                                  'capture_active_o',
+                                  'int_reset_capture',
+                                  'capture_go_start',
+                                  'capture_go_o',
+                                  'adc_delay_cnt == 0',
+                                  'ununsed']]
+
+    # fpga_mode = 13:
+    fpga_mode_definitions[13] = ['sequencer debug (2 triggers)',
+                                 ['trigger 0',
+                                  'trigger 1',
+                                  'too early',
+                                  'too late',
+                                  'sequence trigger output',
+                                  'trigger 0 window',
+                                  'trigger 1 window',
+                                  'armed_and_ready',
+                                  'unused']]
+
+    # fpga_mode = 14:
+    fpga_mode_definitions[14] = ['sequencer/SAD debug',
+                                 ['unused',
+                                  'unused',
+                                  'unused',
+                                  'trigger[0]',
+                                  'trigger[1]',
+                                  'trigger 0 window',
+                                  'trigger 1 window',
+                                  'too late',
+                                  'unused']]
+
+    # fpga_mode = 15:
+    fpga_mode_definitions[15] = ['sequencer/SAD debug (4 triggers)',
+                                 ['trigger 0',
+                                  'trigger 1',
+                                  'trigger 2',
+                                  'trigger 3',
+                                  'trigger 0 window',
+                                  'trigger 1 window',
+                                  'trigger 2 window',
+                                  'trigger 3 window',
+                                  'unused']]
+
+    def __init__(self, oaiface : OAI.OpenADCInterface, trace):
         super().__init__()
+        self._last_mode = None
+        self._drive_data = 0
         self.oa = oaiface
+        self._trace = trace
         self.disable_newattr()
 
     def _dict_repr(self):
-        rtn = OrderedDict()
+        rtn = {}
         rtn['mode'] = self.mode
+        if self.mode in ['fpga_debug', 'swo_trace_plus_debug']:
+            rtn['fpga_mode'] = self.fpga_mode
         rtn['direction'] = self.direction
         rtn['drive_data'] = self.drive_data
         rtn['status'] = self.status
+        pins_rtn = {}
+        trace_pins = ['TMS', 'TCK', 'TDO/SWO', 'unused', 'TRACEDATA[0]', 'TRACEDATA[1]', 'TRACEDATA[2]', 'TRACEDATA[3]', 'TRACECLOCK']
+        for i in range(9):
+            if self.mode == 'trace':
+                info = trace_pins[i]
+            elif self.mode == 'swo_trace_plus_debug':
+                if i < 3:
+                    info = trace_pins[i]
+                else:
+                    info = self.fpga_mode_definitions[self.fpga_mode][1][i]
+            elif self.direction & 2**i:
+                info = 'Husky-driven, '
+                if self.mode == 'normal':
+                    info += 'value = %d' % ((self.status >> i) & 0x01)
+                else:
+                    info = self.fpga_mode_definitions[self.fpga_mode][1][i]
+            else:
+                info = 'Target-driven, value = %d' % ((self.status >> i) & 0x01)
+            if i < 8:
+                pins_rtn['pin D%d' % i] = info
+            else:
+                pins_rtn['pin CK'] = info
+        rtn['Individual pins'] = pins_rtn
         return rtn
 
     def __repr__(self):
@@ -366,110 +561,185 @@ class USERIOSettings(util.DisableNewAttr):
     @property
     def mode(self):
         """Set mode for USERIO pins:
-            "normal": as defined by scope.userio.direction.
-            "trace": for target trace capture.
-            "target_debug_jtag": for target debugging with ChipWhisperer using MPSSE in JTAG mode
-            "target_debug_swd": for target debugging with ChipWhisperer using MPSSE in SWD mode
-            "fpga_debug": for FPGA debug (look to cwhusky_top.v for signal definitions).
+
+        * "normal": as defined by scope.userio.direction.
+        * "trace": for target trace capture.
+        * "target_debug_jtag": for target debugging with ChipWhisperer using MPSSE in JTAG mode
+        * "target_debug_swd": for target debugging with ChipWhisperer using MPSSE in SWD mode
+        * "fpga_debug": for FPGA debug (print the scope.userio object to obtain current signal definition, which is determined by scope.userio.fpga_mode).
+        * "swo_trace_plus_debug": pins D0-D2 are used for SWO trace, D3-D7 for fpga_debug.
         """
-        debug = self.oa.sendMessage(CODE_READ, ADDR_USERIO_DEBUG_DRIVEN, maxResp=1)[0]
-        trace = self.oa.sendMessage(CODE_READ, ADDR_TRACE_EN, maxResp=1)[0]
-        if trace:
-            return "trace"
-        elif debug == 1:
-            return "fpga_debug"
-        elif debug == 2:
-            return "target_debug_jtag"
-        elif debug == 6:
-            return "target_debug_swd"
+        if self._last_mode:
+            return self._last_mode
         else:
-            return "normal"
+            debug = self.oa.sendMessage(CODE_READ, "USERIO_DEBUG_DRIVEN", maxResp=1)[0]
+            if self._trace:
+                trace = self._trace.enabled
+            else:
+                trace = None
+            if trace:
+                return "trace"
+            elif debug == 1:
+                return "fpga_debug"
+            elif debug == 2:
+                return "target_debug_jtag"
+            elif debug == 6:
+                return "target_debug_swd"
+            else:
+                return "normal"
 
     @mode.setter
     def mode(self, setting):
         if setting == 'normal':
-            self.oa.sendMessage(CODE_WRITE, ADDR_USERIO_DEBUG_DRIVEN, [0])
-            self.oa.sendMessage(CODE_WRITE, ADDR_TRACE_EN,            [0])
+            self.oa.sendMessage(CODE_WRITE, "USERIO_DEBUG_DRIVEN", [0])
+            self._trace._set_enabled(0)
         elif setting == 'trace':
-            self.oa.sendMessage(CODE_WRITE, ADDR_USERIO_DEBUG_DRIVEN, [0])
-            self.oa.sendMessage(CODE_WRITE, ADDR_TRACE_EN,            [1])
+            self.oa.sendMessage(CODE_WRITE, "USERIO_DEBUG_DRIVEN", [0])
+            self._trace._set_enabled(1)
+            self._trace._set_userio_dir(3)  # restore default just in case
         elif setting == 'fpga_debug':
-            self.oa.sendMessage(CODE_WRITE, ADDR_USERIO_DEBUG_DRIVEN, [1])
-            self.oa.sendMessage(CODE_WRITE, ADDR_TRACE_EN,            [0])
+            self.oa.sendMessage(CODE_WRITE, "USERIO_DEBUG_DRIVEN", [1])
+            self._trace._set_enabled(0)
+        elif setting == 'swo_trace_plus_debug':
+            self.oa.sendMessage(CODE_WRITE, "USERIO_DEBUG_DRIVEN", [1])
+            self._trace._set_enabled(1)
+            self._trace._set_userio_dir(0xff-4)
         elif setting == 'target_debug_jtag':
-            self.oa.sendMessage(CODE_WRITE, ADDR_USERIO_DEBUG_DRIVEN, [2])
-            self.oa.sendMessage(CODE_WRITE, ADDR_TRACE_EN,            [0])
+            self.oa.sendMessage(CODE_WRITE, "USERIO_DEBUG_DRIVEN", [2])
+            self._trace._set_enabled(0)
         elif setting == 'target_debug_swd':
-            self.oa.sendMessage(CODE_WRITE, ADDR_USERIO_DEBUG_DRIVEN, [6])
-            self.oa.sendMessage(CODE_WRITE, ADDR_TRACE_EN,            [0])
+            self.oa.sendMessage(CODE_WRITE, "USERIO_DEBUG_DRIVEN", [6])
+            self._trace._set_enabled(0)
         else:
             raise ValueError("Invalid mode; use normal/trace/fpga_debug/target_debug_jtag/target_debug_swd")
+        self._last_mode = setting
+
+    @property
+    def fpga_mode(self):
+        """When scope.userio.mode = 'fpga_debug', selects which FPGA signals
+        are routed to the USERIO pins. Print the scope.userio object to obtain the signal definition
+        corresponding to the current fpga_mode setting.
+        """
+        return self.oa.sendMessage(CODE_READ, "USERIO_DEBUG_SELECT", maxResp=1)[0]
+
+    @fpga_mode.setter
+    def fpga_mode(self, setting):
+        if not setting in range(0, 16):
+            raise ValueError("Must be integer in [0, 15]")
+        else:
+            self.oa.sendMessage(CODE_WRITE, "USERIO_DEBUG_SELECT", [setting])
+
 
     @property
     def direction(self):
         """Set the direction of the USERIO data pins (D0-D7) with an
-        8-bit integer, where bit <x> determines the direction of D<x>;
-        bit x = 0: D<x> is an input to Husky.
-        bit x = 1: D<x> is driven by Husky.
+        8-bit integer, where bit <x> determines the direction of D<x>:
+
+        * bit x = 0: D<x> is an input to Husky.
+        * bit x = 1: D<x> is driven by Husky.
+
         When scope.userio.mode is not "normal", then this setting is controlled
         by the FPGA and cannot be changed by the user.
         Use with care.
         """
-        return self.oa.sendMessage(CODE_READ, ADDR_USERIO_CW_DRIVEN, maxResp=1)[0]
+        return self.oa.sendMessage(CODE_READ, "USERIO_CW_DRIVEN", maxResp=1)[0]
 
     @direction.setter
     def direction(self, setting):
         if not setting in range(0, 256):
             raise ValueError("Must be integer 0-255")
         else:
-            self.oa.sendMessage(CODE_WRITE, ADDR_USERIO_CW_DRIVEN, [setting])
+            self.oa.sendMessage(CODE_WRITE, "USERIO_CW_DRIVEN", [setting])
 
     @property
     def drive_data(self):
         """8-bit data to drive on the USERIO data bus.
         """
-        return self.oa.sendMessage(CODE_READ, ADDR_USERIO_DRIVE_DATA, maxResp=1)[0]
+        return self._drive_data
 
     @drive_data.setter
     def drive_data(self, setting):
         if not setting in range(0, 256):
             raise ValueError("Must be integer 0-255")
         else:
-            self.oa.sendMessage(CODE_WRITE, ADDR_USERIO_DRIVE_DATA, [setting])
+            self._drive_data = setting
+            self.oa.sendMessage(CODE_WRITE, "USERIO_DRIVE_DATA", [setting])
 
     @property
     def status(self):
         """Returns current value of header pins. LSB=D0, MSB=CK.
         """
-        raw = self.oa.sendMessage(CODE_READ, ADDR_USERIO_READ, maxResp=2)
+        raw = self.oa.sendMessage(CODE_READ, "USERIO_READ", maxResp=2)
         return int.from_bytes(raw, byteorder='little')
 
 
 
 class XADCSettings(util.DisableNewAttr):
     ''' Husky FPGA XADC temperature and voltage monitoring.
+    XADC alarms are sticky and shut down generated clocks, glitching, and SAD logic; the
+    error condition must be manually cleared (by setting :class:`status` to 0) to re-enable
+    shutdown logic.
+
+    Some of the alarm thresholds can be adjusted, but do so with care. The
+    default thresholds are set to keep the Husky FPGA within its recommended operating range.
+    If you move the thresholds beyond this range, you can irreversibly damage your Husky.
+
+    Use :class:`vcc_limits()` for a full report on VCC limits and observed values.
+
     '''
     _name = 'Husky XADC Setting'
 
     def __init__(self, oaiface : OAI.OpenADCInterface):
         super().__init__()
         self.oa = oaiface
-        self.drp = XilinxDRP(oaiface, ADDR_XADC_DRP_DATA, ADDR_XADC_DRP_ADDR)
+        self.drp = XilinxDRP(oaiface, "XADC_DRP_DATA", "XADC_DRP_ADDR")
         self.disable_newattr()
 
     def _dict_repr(self):
-        rtn = OrderedDict()
+        rtn = {}
         rtn['status'] = self.status
-        rtn['current temperature [C]'] = '%.1f' % self.temp
-        rtn['maximum temperature [C]'] = '%.1f' % self.max_temp
-        rtn['user temperature alarm trigger [C]'] = '%.1f' % self.temp_trigger
-        rtn['user temperature reset trigger [C]'] = '%.1f' % self.temp_reset
-        rtn['device temperature alarm trigger [C]'] = '%.1f' % self.ot_temp_trigger
-        rtn['device temperature reset trigger [C]'] = '%.1f' % self.ot_temp_reset
-        rtn['vccint'] = '%.3f' % self.vccint
-        rtn['vccaux'] = '%.3f' % self.vccaux
-        rtn['vccbram'] = '%.3f' % self.vccbram
+        rtn['temp'] = '%.1f [C]' % self.temp
+        rtn['max_temp'] = '%.1f [C]' % self.max_temp
+        rtn['temp_trigger'] = '%.1f [C]' % self.temp_trigger
+        rtn['temp_reset'] = '%.1f [C]' % self.temp_reset
+        rtn['ot_temp_trigger'] = '%.1f [C]' % self.ot_temp_trigger
+        rtn['ot_temp_reset'] = '%.1f [C]' % self.ot_temp_reset
+        rtn['vccint'] = '%.3f [V]' % self.vccint
+        rtn['vccaux'] = '%.3f [V]' % self.vccaux
+        rtn['vccbram'] = '%.3f [V]' % self.vccbram
         return rtn
+
+    def vcc_limits(self):
+        """Pretty print of limits and observed values for all FPGA VCC rails.
+        'margin' shows how close a rail has come to exceeding either of its limits
+        (negative values meaning that a limit was exceeded).
+        To get the constituent measurements as floats, use :class:`get_vcc_limit()` and :class:`get_vcc()`.
+        Note that min/max values are latched until :class:`user_reset()` is called.
+        """
+        print('        | lower | upper | minimum  | maximum  |          |        ')
+        print('rail    | limit | limit | seen     | seen     | current  | margin ')
+        print('--------+-------+-------+----------+----------+----------+--------')
+        for rail in ['vccint', 'vccaux', 'vccbram']:
+            lower = self.get_vcc_limit(rail, 'lower')
+            upper = self.get_vcc_limit(rail, 'upper')
+            vmin = self.get_vcc(rail, 'min')
+            vcur = self.get_vcc(rail, 'current')
+            vmax = self.get_vcc(rail, 'max')
+            margin = min(upper-vmax, vmin-lower)
+            if vmin < lower:
+                minstat = '❌'
+            else:
+                minstat = '✅'
+            if vmax > upper:
+                maxstat = '❌'
+            else:
+                maxstat = '✅'
+            if vcur > upper or vcur < lower:
+                curstat = '❌'
+            else:
+                curstat = '✅'
+            print('%7s | %.3f | %.3f | %s %.3f | %s %.3f | %s %.3f | %.3f' % (rail, lower, upper, minstat, vmin, maxstat, vmax, curstat, vcur, margin))
+
 
     def __repr__(self):
         return util.dict_to_str(self._dict_repr())
@@ -480,11 +750,12 @@ class XADCSettings(util.DisableNewAttr):
     @property
     def status(self):
         """Read XADC alarm status bits
+
         :Getter: Returns status string.
 
         :Setter: Clear the status error bits (they are sticky).
         """
-        raw = self.oa.sendMessage(CODE_READ, ADDR_XADC_STAT, maxResp=1)[0]
+        raw = self.oa.sendMessage(CODE_READ, "XADC_STAT", maxResp=1)[0]
         stat = ''
         if raw & 1:  stat += 'Over temperature alarm, '
         if raw & 2:  stat += 'User temperature alarm, '
@@ -497,7 +768,7 @@ class XADCSettings(util.DisableNewAttr):
 
     @status.setter
     def status(self, clear):
-        self.oa.sendMessage(CODE_WRITE, ADDR_XADC_STAT, [0x0])
+        self.oa.sendMessage(CODE_WRITE, "XADC_STAT", [0x0])
 
     def errors(self):
         if self.status == 'good':
@@ -508,24 +779,25 @@ class XADCSettings(util.DisableNewAttr):
 
     @property
     def temp(self):
-        """Returns the current FPGA temperature.
+        """Returns the current FPGA temperature (in celcius).
         """
-        return self.get_temp(0)
+        return self._get_temp(0)
 
     @property
     def max_temp(self):
-        """Returns the highest observed FPGA temperature.
+        """Returns the highest observed FPGA temperature (in celcius) since last power-up
+        or :class:`user_reset()` call.
         """
-        return self.get_temp(32)
+        return self._get_temp(32)
 
     @property
     def temp_trigger(self):
         """FPGA user temperature trigger.
         If the FPGA temperature exceeds this value, an error is flagged, and
         all clock-generating modules are shut down until the temperature
-        returns below temp_reset (since they are very power hungry).
+        returns below :class:`temp_reset` (since they are very power hungry).
         """
-        return self.get_temp(0x50)
+        return self._get_temp(0x50)
 
     @temp_trigger.setter
     def temp_trigger(self, temp):
@@ -535,9 +807,9 @@ class XADCSettings(util.DisableNewAttr):
     def temp_reset(self):
         """FPGA user temperature reset.
         When the FPGA temperature returns below this value, the error condition
-        triggered by temp_trigger is cleared.
+        triggered by :class:`temp_trigger` is cleared.
         """
-        return self.get_temp(0x54)
+        return self._get_temp(0x54)
 
     @temp_reset.setter
     def temp_reset(self, temp):
@@ -548,23 +820,26 @@ class XADCSettings(util.DisableNewAttr):
         """FPGA over-temperature trigger.
         If the FPGA temperature exceeds this value, an error is flagged, and
         all clock-generating modules are shut down until the temperature
-        returns below ot_temp_reset (since they are very power hungry).
+        returns below :class:`ot_temp_reset` (since they are very power hungry).
         Read-only.
         """
-        return self.get_temp(0x53)
+        return self._get_temp(0x53)
 
     @property
     def ot_temp_reset(self):
         """FPGA over-temperature reset.
         When the FPGA temperature returns below this value, the error condition
-        triggered by ot_temp_trigger is cleared.
+        triggered by :class:`ot_temp_trigger` is cleared.
+        Read-only.
         """
-        return self.get_temp(0x57)
+        return self._get_temp(0x57)
 
-    def get_temp(self, addr=0):
+    def _get_temp(self, addr=0):
         """Read XADC temperature.
+
         Args:
             addr (int): DRP address (0: current; 32: max; 36: min)
+
         Returns:
             Temperature in celcius (float).
         """
@@ -573,9 +848,11 @@ class XADCSettings(util.DisableNewAttr):
 
     def set_temp(self, temp, addr=0):
         """Set XADC temperature thresholds.
+
         Args:
             addr (int): DRP address
             temp (float): temperature threshold [celcius]
+
         Returns:
             Temperature in celcius (float).
         """
@@ -586,26 +863,33 @@ class XADCSettings(util.DisableNewAttr):
     @property
     def vccint(self):
         """Returns the current VCCint value.
+        Use :class:`get_vcc()` to get max/min values seen.
         """
         return self.get_vcc('vccint')
 
     @property
     def vccaux(self):
         """Returns the current VCCaux value.
+        Use :class:`get_vcc()` to get max/min values seen.
         """
         return self.get_vcc('vccaux')
 
     @property
     def vccbram(self):
         """Returns the current VCCbram value.
+        Use :class:`get_vcc()` to get max/min values seen.
         """
         return self.get_vcc('vccbram')
 
+    def get_vcc(self, rail='vccint', value='current'):
+        """Read XADC VCC. 
+        Can report current value, or minimum/maximum value seen
+        since power-up / last :class:`user_reset()` call.
 
-    def get_vcc(self, rail='vccint'):
-        """Read XADC vcc.
         Args:
             rail (string): 'vccint', 'vccaux', or 'vccbram'
+            value (string): 'current', 'min', or 'max'
+
         Returns:
             voltage (float).
         """
@@ -614,11 +898,103 @@ class XADCSettings(util.DisableNewAttr):
         elif rail == 'vccaux':
             addr = 2
         elif rail == 'vccbram':
-            addr = 6
+            if value == 'current':
+                addr = 6
+            else:
+                addr = 3
         else:
             raise ValueError("Invalid rail")
+        if value == 'current':
+            pass
+        elif value == 'min':
+            addr += 0x24
+        elif value == 'max':
+            addr += 0x20
+        else:
+            raise ValueError("Invalid measurement request")
+
         raw = self.drp.read(addr)
         return (raw>>4)/4096 * 3 # ref: UG480
+
+    def get_vcc_limit(self, rail='vccint', limit='upper'):
+        """Get XADC VCC upper or lower limit (for firing alarm).
+
+        Args:
+            rail (string): 'vccint', 'vccaux', or 'vccbram'
+            limit (string): 'upper', 'lower'
+
+        Returns:
+            voltage (float).
+        """
+        if rail == 'vccint':
+            addr = 0x51
+        elif rail == 'vccaux':
+            addr = 0x52
+        elif rail == 'vccbram':
+            addr = 0x58
+        else:
+            raise ValueError("Invalid rail")
+        if limit == 'lower':
+            addr += 4
+        elif limit == 'upper':
+            pass
+        else:
+            raise ValueError("Invalid limit")
+        raw = self.drp.read(addr)
+        return (raw>>4)/4096 * 3 # ref: UG480
+
+    def _set_vcc_limit(self, value, rail='vccint', limit='upper'):
+        """Set XADC vcc limit.
+
+        Args:
+            value (float): voltage limit
+            rail (string): 'vccint', 'vccaux', or 'vccbram'
+            limit (string): 'upper', 'lower'
+        """
+        if rail == 'vccint':
+            addr = 0x51
+        elif rail == 'vccaux':
+            addr = 0x52
+        elif rail == 'vccbram':
+            addr = 0x58
+        else:
+            raise ValueError("Invalid rail")
+        if limit == 'lower':
+            addr += 4
+        elif limit == 'upper':
+            pass
+        else:
+            raise ValueError("Invalid limit")
+        raw = int(value /3*4096) << 4 # ref: UG480
+        if raw > 2**16:
+            raise ValueError("Out of range")
+        self.drp.write(addr, raw)
+
+    def _enable_vcc_alarms(self, enable):
+        """Enable or disable XADC VCC alarms. Use with care!
+
+        Disabling VCC alarms removes an important layer of protection.
+        Instead of disabling the VCC alarms, consider adjusting the limits
+        with _set_vcc_limit(), or, if the target power-up is what is causing
+        the alarms, adjusting the soft power-on parameters with
+        :meth:`scope.io.husky_soft_poweron  <chipwhisperer.capture.scopes.cwhardware.ChipWhispererExtra.GPIOSettings.husky_soft_poweron>`
+        """
+        addr = 0x41
+        val = self.drp.read(addr)
+        # VCC alarms are disabled when bits 2, 3 and 8 are set, enabled when they are clear (ref: UG480 Table 3.5)
+        mask_enable = 2**16-1 - 2**2 - 2**3 - 2**8
+        mask_disable = 2**2 + 2**3 + 2**8
+        if enable:
+            val &= mask_enable
+        else:
+            val |= mask_disable
+        self.drp.write(addr, val)
+
+    def user_reset(self):
+        """Reset XADC: clears stored min/max temperature and voltage measurements.
+        Does not clear active error flags; set :class:`status` to 0 to clear error flags.
+        """
+        self.drp.write(0x03, 0xeeee) # (ref: UG480, "XADC JTAG Reset")
 
 
 class LASettings(util.DisableNewAttr):
@@ -632,10 +1008,11 @@ class LASettings(util.DisableNewAttr):
         self.oa = oaiface
         self._mmcm = mmcm
         self._scope = scope
+        self._is_husky_plus = False
         self.disable_newattr()
 
     def _dict_repr(self):
-        rtn = OrderedDict()
+        rtn = {}
         rtn['present'] = self.present
         rtn['enabled'] = self.enabled
         rtn['clkgen_enabled'] = self.clkgen_enabled
@@ -683,8 +1060,8 @@ class LASettings(util.DisableNewAttr):
     def trigger_now(self):
         """Trigger the capture manually.
         """
-        self.oa.sendMessage(CODE_WRITE, ADDR_LA_MANUAL_CAPTURE, [1], Validate=False)
-        self.oa.sendMessage(CODE_WRITE, ADDR_LA_MANUAL_CAPTURE, [0], Validate=False)
+        self.oa.sendMessage(CODE_WRITE, "LA_MANUAL_CAPTURE", [1], Validate=False)
+        self.oa.sendMessage(CODE_WRITE, "LA_MANUAL_CAPTURE", [0], Validate=False)
 
 
     @staticmethod
@@ -701,7 +1078,7 @@ class LASettings(util.DisableNewAttr):
         """ Return whether the logic analyzer functionality is present in this build (True or False).
         If it is not present, none of the functionality of this class is available.
         """
-        raw = self.oa.sendMessage(CODE_READ, ADDR_COMPONENTS_EXIST, Validate=False, maxResp=1)[0]
+        raw = self.oa.sendMessage(CODE_READ, "COMPONENTS_EXIST", Validate=False, maxResp=1)[0]
         if raw & 1:
             return True
         else:
@@ -711,29 +1088,38 @@ class LASettings(util.DisableNewAttr):
     def locked(self):
         """ Return whether the sampling clock MMCM is locked (True or False).
         """
-        raw = self.oa.sendMessage(CODE_READ, ADDR_LA_STATUS, Validate=False, maxResp=1)[0]
-        if raw & 1:
+        raw = self.oa.sendMessage(CODE_READ, "LA_ENABLED", Validate=False, maxResp=1)[0]
+        if raw & 2:
             return True
         else:
             return False
+
+    @property
+    def max_capture_depth(self):
+        """Maximum capture depth.
+        """
+        if self._is_husky_plus:
+            return 65535
+        else:
+            return 16376
 
     @property
     def capture_depth(self):
         """Number of bits captured for each signal.
 
         Args:
-            depth (int): capture <depth> samples of each signal. 16-bit value, in range [1, 16376].
+            depth (int): capture <depth> samples of each signal. 16-bit value, in range [1, scope.LA.max_capture_depth]
         """
-        raw = self.oa.sendMessage(CODE_READ, ADDR_LA_CAPTURE_DEPTH, Validate=False, maxResp=2)
+        raw = self.oa.sendMessage(CODE_READ, "LA_CAPTURE_DEPTH", Validate=False, maxResp=2)
         return int.from_bytes(raw, byteorder='little')
 
     @capture_depth.setter
     def capture_depth(self, depth):
-        if depth > 16376:
-            raise ValueError("Maximum capture depth is 16376")
+        if depth > self.max_capture_depth:
+            raise ValueError("Maximum capture depth is %s" % self.max_capture_depth)
         if depth % 2:
             depth -= 1
-        self.oa.sendMessage(CODE_WRITE, ADDR_LA_CAPTURE_DEPTH, int.to_bytes(depth, length=2, byteorder='little'), Validate=False)
+        self.oa.sendMessage(CODE_WRITE, "LA_CAPTURE_DEPTH", int.to_bytes(depth, length=2, byteorder='little'), Validate=False)
 
 
     @property
@@ -742,7 +1128,7 @@ class LASettings(util.DisableNewAttr):
         and trace components share the same FPGA storage, so they cannot be
         simultaneously enabled.
         """
-        raw = self.oa.sendMessage(CODE_READ, ADDR_LA_ENABLED, Validate=False, maxResp=1)[0]
+        raw = self.oa.sendMessage(CODE_READ, "LA_ENABLED", Validate=False, maxResp=1)[0] & 0x01
         if raw:
             return True
         else:
@@ -750,27 +1136,28 @@ class LASettings(util.DisableNewAttr):
 
     @enabled.setter
     def enabled(self, enable):
+        raw = self.oa.sendMessage(CODE_READ, "LA_ENABLED", Validate=False, maxResp=1)[0]
         if enable:
-            val = [1]
+            val = raw | 0x01
             # only one of Trace/LA can be enabled at once:
             if self._scope.trace.enabled and self._scope.trace.capture.mode != 'off':
                 scope_logger.warning("Can't enable scope.LA and scope.trace simultaneously; turning off scope.trace.")
                 self._scope.trace.enabled = False
             self.clkgen_enabled = True
         else:
-            val = [0]
-        self.oa.sendMessage(CODE_WRITE, ADDR_LA_ENABLED, val, Validate=False)
+            val = raw & 0xfe
+        self.oa.sendMessage(CODE_WRITE, "LA_ENABLED", [val], Validate=False)
         self.reset_MMCM()
 
     @property
     def clkgen_enabled(self):
-        """Controls whether the Xilinx MMCM used to generate the samplign clock
+        """Controls whether the Xilinx MMCM used to generate the sampling clock
         is powered on or not.  7-series MMCMs are power hungry. In the Husky
         FPGA, MMCMs are estimated to consume close to half of the FPGA's power.
         If you run into temperature issues and don't require the logic analyzer
         or debug trace functionality, power down this MMCM.
         """
-        raw = self.oa.sendMessage(CODE_READ, ADDR_LA_POWERDOWN, Validate=False, maxResp=1)[0]
+        raw = self.oa.sendMessage(CODE_READ, "LA_POWERDOWN", Validate=False, maxResp=1)[0]
         if raw == 1:
             return False
         elif raw == 0:
@@ -784,7 +1171,7 @@ class LASettings(util.DisableNewAttr):
             val = [0]
         else:
             val = [1]
-        self.oa.sendMessage(CODE_WRITE, ADDR_LA_POWERDOWN, val, Validate=False)
+        self.oa.sendMessage(CODE_WRITE, "LA_POWERDOWN", val, Validate=False)
         self.reset_MMCM()
 
 
@@ -793,8 +1180,8 @@ class LASettings(util.DisableNewAttr):
         """The clock signal that the logic analyzer is using to generate its sampling clock.
 
         There are three different sources:
-         * "target": The HS1 clock from the target device.
-         * "clkgen": The CLKGEN DCM output.
+         * "target": The clock from the target device (from HS1 or AUX, as per scope.clock.clkgen_src)
+         * "usb": The 96 MHz internal USB clock.
          * "pll": Husky's on-board PLL clock.
 
         :Getter:
@@ -804,7 +1191,7 @@ class LASettings(util.DisableNewAttr):
            Change the clock source
 
         Raises:
-           ValueError: New value not one of "target", "clkgen" or "pll"
+           ValueError: New value not one of "target", "usb" or "pll"
         """
 
         return self._getClkSource()
@@ -815,7 +1202,7 @@ class LASettings(util.DisableNewAttr):
         self.reset_MMCM()
 
     def arm(self):
-        self.oa.sendMessage(CODE_WRITE, ADDR_LA_ARM, [1], Validate=False)
+        self.oa.sendMessage(CODE_WRITE, "LA_ARM", [1], Validate=False)
 
     @property
     def errors(self):
@@ -837,7 +1224,6 @@ class LASettings(util.DisableNewAttr):
     @errors.setter
     def errors(self, val):
         self.oa.sendMessage(CODE_WRITE, self._scope.trace.REG_CLEAR_ERRORS, [1], Validate=False)
-
 
     def read_capture_data(self, check_empty=False):
         """Read captured data.
@@ -934,15 +1320,26 @@ class LASettings(util.DisableNewAttr):
         """The trigger used by the logic analyzer to capture.
 
         There are several different sources:
-         * "glitch": The internal glitch trigger.
-         * "capture": The internal ADC capture trigger.
-         * "glitch_source": The internal glitch trigger in the source clock
-                            domain. This comes before "glitch", since there is
-                            a clock domain crossing from "glitch_source" to "glitch"
-         * "HS1": The HS1 input clock.
 
-         In addition, capture can be triggered manually, irrespective of the trigger_source
-         setting, by calling scope.LA.trigger_now()
+        * "glitch": The internal glitch enable trigger, one cycle earlier than the
+          glitch output seen when scope.glitch.output = 'enable_only'. This
+          signal is in the MMCM1 clock glitch domain.
+        * "capture": The internal ADC capture trigger.
+        * "glitch_source": The internal manual glitch trigger in the source or target clock
+          domain (as per scope.glitch.clk_src), which accounts for 
+          scope.glitch.ext_offset but not scope.glitch.offset. Should
+          only be used with scope.glitch.trigger_src = 'manual'; may
+          not fire reliably with other settings.
+        * "glitch_trigger": The internal glitch trigger in the MMCM1 clock domain.
+        * "trigger_glitch": The trigger *for* the glitch module (aka scope.trigger.triggers).
+        * "HS1": The HS1 input clock.
+        * "rising_userio_d[0-7]": a rising edge (0->1) on a USERIO pin
+        * "falling_userio_d[0-7]": a falling edge (1->0) on a USERIO pin
+        * "rising_tio[0-3]": a rising edge (0->1) on a tio pin
+        * "failling_tio[0-3]": a falling edge (0->1) on a tio pin
+
+        In addition, capture can be triggered manually, irrespective of the trigger_source
+        setting, by calling :class:`trigger_now`.
 
         :Getter:
            Return the trigger source currently in use
@@ -951,7 +1348,7 @@ class LASettings(util.DisableNewAttr):
            Change the trigger source
 
         Raises:
-           ValueError: New value not one of "glitch" or "capture"
+           ValueError: New value not one of the options listed above.
         """
 
         return self._getTriggerSource()
@@ -996,6 +1393,14 @@ class LASettings(util.DisableNewAttr):
         return self._scope.trace.clock.swo_clock_freq
 
     @property
+    def source_clock_frequency(self):
+        """Report the actual clock frequency of the input clock to the shared LA/trace MMCM.
+        """
+        raw = int.from_bytes(self.oa.sendMessage(CODE_READ, "LA_SOURCE_FREQ", Validate=False, maxResp=4), byteorder='little')
+        freq = raw * 96e6 / float(pow(2,23))
+        return freq
+
+    @property
     def downsample(self):
         """Downsample setting.
 
@@ -1014,43 +1419,47 @@ class LASettings(util.DisableNewAttr):
         """Sets which group of signals are captured.
 
         There are three groups. The signals captured for each group are as follows:
-        'glitch' (group 0):
 
-            #. glitch output
-            #. source clock of glitch module
-            #. glitch internal MMCM1 (offset) output
-            #. glitch internal MMCM2 (width) output
-            #. glitch trigger
-            #. capture trigger
-            #. glitch enable
-            #. glitch trigger in its source clock domain (e.g. signal 1 of this group)
+        * 'glitch' (group 0):
 
-        'CW 20-pin' (group 1):
+          #. glitch output
+          #. source clock of glitch module
+          #. glitch internal MMCM1 (offset) output
+          #. glitch internal MMCM2 (width) output
+          #. glitch go internal signal
+          #. capture trigger
+          #. glitch enable
+          #. manual glitch trigger in source clock domain (e.g. signal 1 of this group)
+          #. glitch trigger in MMCM1 clock domain
 
-            #. IO1
-            #. IO2
-            #. IO3
-            #. IO4
-            #. HS1
-            #. HS2
-            #. AUX MCX
-            #. TRIG MCX
-            #. ADC sampling clock
+        * 'CW 20-pin' (group 1):
 
-        'USERIO 20-pin' (group 2):
+          #. IO1
+          #. IO2
+          #. IO3
+          #. IO4
+          #. HS1
+          #. HS2
+          #. AUX MCX
+          #. TRIG MCX
+          #. ADC sampling clock
 
-            #. D0
-            #. D1
-            #. D2
-            #. D3
-            #. D4
-            #. D5
-            #. D6
-            #. D7
-            #. CK
+        * 'USERIO 20-pin' (group 2):
 
-        'trigger debug' (group 3)
-        'internal trace' (group 4)
+          #. D0
+          #. D1
+          #. D2
+          #. D3
+          #. D4
+          #. D5
+          #. D6
+          #. D7
+          #. CK
+
+        * 'trigger debug' (group 3) - for development only, definitions in Verilog source
+        * 'internal trace 1' (group 4) - for development only, definitions in Verilog source
+        * 'internal trace 2' (group 5) - for development only, definitions in Verilog source
+        * 'glitch debug' (group 6) - for development only, definitions in Verilog source
 
         :Getter:
            Return the capture group currently in use.
@@ -1071,20 +1480,20 @@ class LASettings(util.DisableNewAttr):
     def _setClkSource(self, source):
         if source == 'target':
             val = [0]
-        elif source == 'clkgen':
+        elif source == 'usb':
             val = [1]
         elif source == 'pll':
             val = [2]
         else:
-            raise ValueError("Must be one of 'target', 'clkgen', or 'pll'")
-        self.oa.sendMessage(CODE_WRITE, ADDR_LA_CLOCK_SOURCE, val, Validate=False)
+            raise ValueError("Must be one of 'target', 'usb', or 'pll'")
+        self.oa.sendMessage(CODE_WRITE, "LA_CLOCK_SOURCE", val, Validate=False)
 
     def _getClkSource(self):
-        raw = self.oa.sendMessage(CODE_READ, ADDR_LA_CLOCK_SOURCE, Validate=False, maxResp=1)[0]
+        raw = self.oa.sendMessage(CODE_READ, "LA_CLOCK_SOURCE", Validate=False, maxResp=1)[0]
         if raw == 0:
             return 'target'
         elif raw == 1:
-            return 'clkgen'
+            return 'usb'
         elif raw == 2:
             return 'pll'
         else:
@@ -1099,12 +1508,28 @@ class LASettings(util.DisableNewAttr):
             val = [2]
         elif source == 'HS1':
             val = [3]
+        elif source == 'glitch_trigger':
+            val = [4]
+        elif source == 'trigger signal 0':
+            val = [5]
+        elif source == 'trigger signal 1':
+            val = [6]
+        elif source == 'trigger_glitch':
+            val = [7]
+        elif 'rising_userio_d' in source:
+            val = [0x08 + int(source[-1])]
+        elif 'falling_userio_d' in source:
+            val = [0x18 + int(source[-1])]
+        elif 'rising_tio' in source:
+            val = [0x20 + int(source[-1]) - 1]
+        elif 'falling_tio' in source:
+            val = [0x28 + int(source[-1]) - 1]
         else:
-            raise ValueError("Must be one of 'glitch', 'capture', 'glitch_source', or 'HS1'")
-        self.oa.sendMessage(CODE_WRITE, ADDR_LA_TRIGGER_SOURCE, val, Validate=False)
+            raise ValueError("Must be one of 'glitch', 'capture', 'glitch_source', 'HS1', '[rising|falling]_userio_d[0-7]', or [rising|falling]_tio[0-3]")
+        self.oa.sendMessage(CODE_WRITE, "LA_TRIGGER_SOURCE", val, Validate=False)
 
     def _getTriggerSource(self):
-        raw = self.oa.sendMessage(CODE_READ, ADDR_LA_TRIGGER_SOURCE, Validate=False, maxResp=1)[0]
+        raw = self.oa.sendMessage(CODE_READ, "LA_TRIGGER_SOURCE", Validate=False, maxResp=1)[0]
         if raw == 0:
             return 'glitch'
         elif raw == 1:
@@ -1113,11 +1538,27 @@ class LASettings(util.DisableNewAttr):
             return 'glitch_source'
         elif raw == 3:
             return 'HS1'
+        elif raw == 4:
+            return 'glitch_trigger'
+        elif raw == 5:
+            return 'trigger signal 0'
+        elif raw == 6:
+            return 'trigger signal 1'
+        elif raw == 7:
+            return 'trigger_glitch'
+        elif raw in range(0x8, 0x10):
+            return 'rising_userio_d' + str(raw & 0x07)
+        elif raw in range(0x10, 0x20):
+            return 'falling_userio_d' + str(raw & 0x07)
+        elif raw in range(0x20, 0x24):
+            return 'rising_tio' + str((raw & 0x03) + 1)
+        elif raw in range(0x28, 0x2c):
+            return 'falling_tio' + str((raw & 0x03) + 1)
         else:
             raise ValueError("Unexpected: read %d" % raw)
 
     def _setOversamplingFactor(self, factor):
-        self._scope.trace.clock.swo_clock_freq = self._scope.trace.clock.fe_freq * factor
+        self._scope.trace.clock.swo_clock_freq = self.source_clock_frequency * factor
 
     def _getOversamplingFactor(self):
         return self._mmcm.get_mul() // (self._mmcm.get_main_div() * self._mmcm.get_sec_div())
@@ -1126,10 +1567,10 @@ class LASettings(util.DisableNewAttr):
         if factor < 1 or factor > 2**16:
             raise ValueError("Error: downsample value out of range.")
         factor -= 1
-        self.oa.sendMessage(CODE_WRITE, ADDR_LA_DOWNSAMPLE, int.to_bytes(factor, length=2, byteorder='little'), Validate=False)
+        self.oa.sendMessage(CODE_WRITE, "LA_DOWNSAMPLE", int.to_bytes(factor, length=2, byteorder='little'), Validate=False)
 
     def _getDownsample(self):
-        return int.from_bytes(self.oa.sendMessage(CODE_READ, ADDR_LA_DOWNSAMPLE, Validate=False, maxResp=2), byteorder='little') + 1
+        return int.from_bytes(self.oa.sendMessage(CODE_READ, "LA_DOWNSAMPLE", Validate=False, maxResp=2), byteorder='little') + 1
 
 
     def _setCaptureGroup(self, group):
@@ -1141,14 +1582,18 @@ class LASettings(util.DisableNewAttr):
             num = 2
         elif group == 'trigger debug':
             num = 3
-        elif group == 'internal trace':
+        elif group == 'internal trace 1':
             num = 4
+        elif group == 'internal trace 2':
+            num = 5
+        elif group == 'glitch debug':
+            num = 6
         else:
             raise ValueError("invalid group name")
-        self.oa.sendMessage(CODE_WRITE, ADDR_LA_CAPTURE_GROUP, [num], Validate=False)
+        self.oa.sendMessage(CODE_WRITE, "LA_CAPTURE_GROUP", [num], Validate=False)
 
     def _getCaptureGroup(self):
-        num = self.oa.sendMessage(CODE_READ, ADDR_LA_CAPTURE_GROUP, Validate=False, maxResp=1)[0]
+        num = self.oa.sendMessage(CODE_READ, "LA_CAPTURE_GROUP", Validate=False, maxResp=1)[0]
         if num == 0:
             group = 'glitch'
         elif num == 1:
@@ -1158,7 +1603,11 @@ class LASettings(util.DisableNewAttr):
         elif num == 3:
             group = 'trigger debug'
         elif num == 4:
-            group = 'internal trace'
+            group = 'internal trace 1'
+        elif num == 5:
+            group = 'internal trace 2'
+        elif num == 6:
+            group = 'glitch debug'
         else:
             raise ValueError("invalid group name")
         return group
@@ -1178,7 +1627,7 @@ class ADS4128Settings(util.DisableNewAttr):
         self.disable_newattr()
 
     def _dict_repr(self):
-        rtn = OrderedDict()
+        rtn = {}
         rtn['mode'] = self.mode
         rtn['low_speed'] = self.low_speed
         rtn['hi_perf'] = self.hi_perf
@@ -1194,29 +1643,29 @@ class ADS4128Settings(util.DisableNewAttr):
         """Resets the ADC.
         Note this is done by the FPGA - see reg_husky_adc.v
         """
-        self.oa.sendMessage(CODE_WRITE, ADDR_HUSKY_ADC_CTRL, [0x41])
-        self.oa.sendMessage(CODE_WRITE, ADDR_HUSKY_ADC_CTRL, [0xc1])
-        self.oa.sendMessage(CODE_WRITE, ADDR_HUSKY_ADC_CTRL, [0x41])
+        self.oa.sendMessage(CODE_WRITE, "CW_ADC_CTRL", [0x41])
+        self.oa.sendMessage(CODE_WRITE, "CW_ADC_CTRL", [0xc1])
+        self.oa.sendMessage(CODE_WRITE, "CW_ADC_CTRL", [0x41])
 
     def _adc_write(self, address, data):
         """Write ADC configuration register.
         Note this is done by the FPGA - see reg_husky_adc.v
         """
-        self.oa.sendMessage(CODE_WRITE, ADDR_HUSKY_ADC_CTRL, [0x41])
+        self.oa.sendMessage(CODE_WRITE, "CW_ADC_CTRL", [0x41])
         for i in range(8):
             bit = (address >> (7-i)) & 1
             val = (bit << 4) + 1
-            self.oa.sendMessage(CODE_WRITE, ADDR_HUSKY_ADC_CTRL, [val])
+            self.oa.sendMessage(CODE_WRITE, "CW_ADC_CTRL", [val])
             val = (bit << 4) + 0
-            self.oa.sendMessage(CODE_WRITE, ADDR_HUSKY_ADC_CTRL, [val])
+            self.oa.sendMessage(CODE_WRITE, "CW_ADC_CTRL", [val])
 
         for i in range(8):
             bit = (data >> (7-i)) & 1
             val = (bit << 4) + 1
-            self.oa.sendMessage(CODE_WRITE, ADDR_HUSKY_ADC_CTRL, [val])
+            self.oa.sendMessage(CODE_WRITE, "CW_ADC_CTRL", [val])
             val = (bit << 4) + 0
-            self.oa.sendMessage(CODE_WRITE, ADDR_HUSKY_ADC_CTRL, [val])
-        self.oa.sendMessage(CODE_WRITE, ADDR_HUSKY_ADC_CTRL, [val])
+            self.oa.sendMessage(CODE_WRITE, "CW_ADC_CTRL", [val])
+        self.oa.sendMessage(CODE_WRITE, "CW_ADC_CTRL", [val])
 
     def _adc_read(self, address):
         """Read ADC configuration register.
@@ -1224,16 +1673,16 @@ class ADS4128Settings(util.DisableNewAttr):
         """
         # first, enable readout:
         self._adc_write(0x0, 0x1)
-        self.oa.sendMessage(CODE_WRITE, ADDR_HUSKY_ADC_CTRL, [0x41])
+        self.oa.sendMessage(CODE_WRITE, "CW_ADC_CTRL", [0x41])
         for i in range(8):
             bit = (address >> (7-i)) & 1
-            self.oa.sendMessage(CODE_WRITE, ADDR_HUSKY_ADC_CTRL, [(bit<<4) + 1])
-            self.oa.sendMessage(CODE_WRITE, ADDR_HUSKY_ADC_CTRL, [(bit<<4) + 0])
+            self.oa.sendMessage(CODE_WRITE, "CW_ADC_CTRL", [(bit<<4) + 1])
+            self.oa.sendMessage(CODE_WRITE, "CW_ADC_CTRL", [(bit<<4) + 0])
         for i in range(8):
-            self.oa.sendMessage(CODE_WRITE, ADDR_HUSKY_ADC_CTRL, [0x01])
-            self.oa.sendMessage(CODE_WRITE, ADDR_HUSKY_ADC_CTRL, [0x02])
-        self.oa.sendMessage(CODE_WRITE, ADDR_HUSKY_ADC_CTRL, [0x41])
-        data =  self.oa.sendMessage(CODE_READ, ADDR_HUSKY_ADC_CTRL, maxResp=1)[0]
+            self.oa.sendMessage(CODE_WRITE, "CW_ADC_CTRL", [0x01])
+            self.oa.sendMessage(CODE_WRITE, "CW_ADC_CTRL", [0x02])
+        self.oa.sendMessage(CODE_WRITE, "CW_ADC_CTRL", [0x41])
+        data =  self.oa.sendMessage(CODE_READ, "CW_ADC_CTRL", maxResp=1)[0]
         # finished, disable readout:
         self._adc_write(0x0, 0x0)
         return data
@@ -1304,10 +1753,10 @@ class ADS4128Settings(util.DisableNewAttr):
     def setMode(self, mode):
         if mode == "normal":
             self.set_normal_settings()
-            self.oa.sendMessage(CODE_WRITE, ADDR_NO_CLIP_ERRORS, [0])
+            self.oa.sendMessage(CODE_WRITE, "NO_CLIP_ERRORS", [0])
         elif mode in ("test ramp", "test alternating"):
             self.set_test_settings(mode)
-            self.oa.sendMessage(CODE_WRITE, ADDR_NO_CLIP_ERRORS, [1])
+            self.oa.sendMessage(CODE_WRITE, "NO_CLIP_ERRORS", [1])
         else:
             raise ValueError("Invalid mode, only 'normal', 'test ramp' or 'test alternating' allowed")
 

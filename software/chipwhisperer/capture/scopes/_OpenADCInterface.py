@@ -15,59 +15,12 @@ import array
 import numpy as np
 from collections import OrderedDict
 import copy
+import io
+import re
 
 from chipwhisperer.logging import *
 
-ADDR_GAIN       = 0
-ADDR_SETTINGS   = 1
-ADDR_STATUS     = 2
-ADDR_ADCDATA    = 3
-ADDR_ECHO       = 4
-ADDR_FREQ       = 5
-ADDR_ADVCLK     = 6
-ADDR_SYSFREQ    = 7
-ADDR_ADCFREQ    = 8
-ADDR_PHASE      = 9
-ADDR_VERSIONS   = 10
-ADDR_FPGA_BUILDTIME = 11
-ADDR_OFFSET     = 26
-ADDR_DECIMATE   = 15
-ADDR_SAMPLES    = 16
-ADDR_PRESAMPLES = 17
-ADDR_BYTESTORX  = 18
-ADDR_TRIGGERDUR = 20
-ADDR_MULTIECHO  = 34
-ADDR_DATA_SOURCE = 27
-ADDR_RESET      = 28
-ADDR_ADC_LOW_RES = 29
-ADDR_CLKGEN_DRP_ADDR = 30
-ADDR_CLKGEN_DRP_DATA = 31
-ADDR_SEGMENTS   = 32
-ADDR_SEGMENT_CYCLES = 33
-ADDR_STREAM_SEGMENT_THRESHOLD = 35
-ADDR_FAST_FIFO_READ = 36
-
-ADDR_FIFO_STAT     = 44
-ADDR_NO_CLIP_ERRORS = 45
-ADDR_CLKGEN_POWERDOWN = 48
-
-ADDR_HUSKY_VMAG_CTRL = 61
-
-ADDR_FIFO_UNDERFLOW_COUNT = 66
-ADDR_FIFO_NO_UNDERFLOW_ERROR = 67
-
-ADDR_CLKGEN_DRP_RESET  = 81
-
-ADDR_CLIP_TEST         = 85
-
-ADDR_CAPTURE_DONE   = 89
-ADDR_FIFO_FIRST_ERROR = 90
-ADDR_FIFO_FIRST_ERROR_STATE = 91
-ADDR_SEGMENT_CYCLE_COUNTER_EN = 92
-
-ADDR_MAX_SAMPLES = 93
-ADDR_MAX_SEGMENT_SAMPLES = 94
-
+from typing import Optional, Type, Union, List, Any
 
 CODE_READ       = 0x80
 CODE_WRITE      = 0xC0
@@ -91,6 +44,8 @@ STATUS_DDRERR_MASK = 0x20
 STATUS_DDRMODE_MASK= 0x40
 STATUS_OVERFLOW_MASK = 0x80
 
+MSG_HDR_SIZE = 3
+
 # sign extend b low bits in x
 # from "Bit Twiddling Hacks"
 def SIGNEXT(x, b):
@@ -100,9 +55,11 @@ def SIGNEXT(x, b):
 
 class OpenADCInterface(util.DisableNewAttr):
 
-    def __init__(self, serial_instance):
+    def __init__(self, serial_instance, registers):
         super().__init__()
         self.serial = serial_instance
+        self._registers = registers
+        self.registers = {}
         self.hwInfo = None
         self.offset = 0.5
         self.ddrMode = False
@@ -124,9 +81,12 @@ class OpenADCInterface(util.DisableNewAttr):
         self.hwMaxSamples = 0
         self.hwMaxSegmentSamples = 0
         self._stream_len = 0
+        self._total_samples = 0
         self._int_data = None
         self._stream_rx_bytes = 0
         self._clear_caches()
+
+        self._slurp_registers()
 
         self.settings()
 
@@ -142,6 +102,51 @@ class OpenADCInterface(util.DisableNewAttr):
     def _clear_caches(self):
         self.cached_settings = None
 
+    def _slurp_registers(self):
+        """ Parse Verilog register defines file so we can access register address
+        definitions by name.
+
+        """
+        self.verilog_define_matches = 0
+
+        if type(self._registers) == io.BytesIO:
+            registers = io.TextIOWrapper(self._registers)
+        else:
+            if not os.path.isfile(self._registers):
+                scope_logger.error('Cannot find %s' % self._registers)
+            registers = open(self._registers, 'r', encoding='utf-8')
+        define_regex_base  =   re.compile(r'`define')
+        define_regex_reg   =   re.compile(r'`define\s+?REG_')
+        define_regex_radix =   re.compile(r'`define\s+?(\w+).+?\'([bdh])([0-9a-fA-F]+)')
+        define_regex_noradix = re.compile(r'`define\s+?(\w+?)\s+?(\d+)')
+        block_offset = 0
+        for define in registers:
+            if define_regex_base.search(define):
+                reg = define_regex_reg.search(define)
+                match = define_regex_radix.search(define)
+                if match:
+                    self.verilog_define_matches += 1
+                    if match.group(2) == 'b':
+                        radix = 2
+                    elif match.group(2) == 'h':
+                        radix = 16
+                    else:
+                        radix = 10
+                    self.registers[match.group(1)] = int(match.group(3),radix) + block_offset
+                    #setattr(self, match.group(1), int(match.group(3),radix) + block_offset)
+                    scope_logger.debug('_slurp_registers: setting %s to %d' % (match.group(1), int(match.group(3),radix) + block_offset))
+                else:
+                    match = define_regex_noradix.search(define)
+                    if match:
+                        self.verilog_define_matches += 1
+                        self.registers[match.group(1)] = int(match.group(2),10) + block_offset
+                        #setattr(self, match.group(1), int(match.group(2),10) + block_offset)
+                        scope_logger.debug('_slurp_registers: setting %s to %d' % (match.group(1), int(match.group(2),10) + block_offset))
+                    else:
+                        scope_logger.warning("Couldn't parse line: %s", define)
+        registers.close()
+        scope_logger.debug("Found %d Verilog register definitions." % self.verilog_define_matches)
+
 
     def setStreamMode(self, stream):
         self._stream_mode = stream
@@ -149,7 +154,6 @@ class OpenADCInterface(util.DisableNewAttr):
 
     def setStreamSegmentSize(self, size):
         self._stream_segment_size = size
-
 
     def setFastSMC(self, active):
         self.setFastFIFORead(active)
@@ -164,185 +168,274 @@ class OpenADCInterface(util.DisableNewAttr):
     def timeout(self):
         return self._timeout
 
-    def testAndTime(self):
-        totalbytes = 0
-        totalerror = 0
+    @property
+    def _serial_not_stream(self):
+        """Gets a value indicating if the serial instance is not in streaming mode.
 
-        for n in range(10):
-            # Generate 500 bytes
-            testData = bytearray(list(range(250)) + list(range(250))) #bytearray(random.randint(0,255) for r in xrange(500))
-            self.sendMessage(CODE_WRITE, ADDR_MULTIECHO, testData, False)
-            testDataEcho = self.sendMessage(CODE_READ, ADDR_MULTIECHO, None, False, 502)
-            testDataEcho = testDataEcho[2:]
+        Return:
+            False if a generic serial interface with no stream attribute or if explicitly in stream
+        mode, else True if serial is explicitly not in stream mode.
+        """
+        return hasattr(self.serial, "stream") and self.serial.stream is False
 
-            #Compare
-            totalerror = totalerror + len([(i,j) for i,j in zip(testData,testDataEcho) if i!=j])
-            totalbytes = totalbytes + len(testData)
+    def _send_msg_hdr(self, mode, addr, dlen):
+        """Sends a serial command header to the device.
+        """
+        buf = bytearray(MSG_HDR_SIZE)
+        buf[0] = mode | addr
+        util.pack_u16_into(buf, 1, dlen)
+        self.serial.write(buf)
 
-            scope_logger.error('%d errors in %d' % (totalerror, totalbytes))
+    def msg_read(self, address, max_resp=None):
+        """Reads the response from the device after issuing a command to it.
+
+        Return:
+            A bytearray of the response received from the device.
+        """
+        address = self._address_str2int(address)
+        if not max_resp:
+            if address == self._address_str2int("ADCREAD_ADDR"):
+                max_resp = 65000
+            else:
+                max_resp = 1
+
+        self.flushInput()
+
+        if self._serial_not_stream:
+            if self._fast_fifo_read_active and address != self._address_str2int("ADCREAD_ADDR"):
+                scope_logger.warning("Internal error: in fast read mode but not reading FIFO! (address=%0d)." % address)
+                scope_logger.warning("This happens when attempting to access (read or write) some Husky FPGA setting after the")
+                scope_logger.warning("ADC sample FIFO read has been set up; in stream mode, this is done when scope.arm() is called.")
+                scope_logger.warning("If this happens to you as a user: access scope.* settings before calling scope.arm(), not after.")
+                scope_logger.warning("If this happens to you as a developer, you can resolve this by caching the setting you need.")
+                scope_logger.warning("The error trace below will show you what led to this:")
+                raise ValueError
+
+            data = self.serial.cmdReadMem(address, max_resp)
+        else:
+            self._send_msg_hdr(CODE_READ, address, 0)
+            data = self.serial.read(max_resp)
+
+            if len(data) < 1:
+                self.flushInput()
+                scope_logger.warning('Timeout in read: %d (address: 0x%02x)' % (len(data), address))
+                return None
+
+        return bytearray(data)
+
+    def _address_str2int(self, address):
+        if type(address) is str:
+            if address in self.registers:
+                return self.registers[address]
+            else:
+                raise KeyError('Unknown register %s' % address)
+        else:
+            return address
+
+
+    def msg_write(self, address, payload):
+        """Sends a command message to the device.
+        """
+        payload = util.get_bytes_memview(payload)
+        if len(payload) < 1:
+            scope_logger.warning('Invalid payload for mode')
+            return
+
+        address = self._address_str2int(address)
+        if self._serial_not_stream:
+            # Write output to memory
+            self.serial.cmdWriteMem(address, payload)
+        else:
+            self._send_msg_hdr(CODE_WRITE, address, len(payload))
+            self.serial.write(payload)
+
+    def msg_validate(self, address, data, read_mask=None):
+        """Validates that a previous write was successful by reading from the same address and
+        comparing the payload to the provided expected data.
+        """
+        data = util.get_bytes_memview(data)
+        pba = bytearray(len(data))
+        address = self._address_str2int(address)
+        check = self.msg_read(address, len(data))
+
+        if read_mask:
+            try:
+                for i, m in enumerate(read_mask):
+                    check[i] = check[i] & m
+                    pba[i] = pba[i] & m
+            except IndexError:
+                pass
+
+        if check == payload:
+            return
+
+        errmsg = "For address 0x%02x=%d" % (address, address)
+        errmsg += "  Sent data: "
+        for c in pba: errmsg += "%02x" % c
+        errmsg += " Read data: "
+        if check:
+            for c in check: errmsg += "%02x" % c
+        else:
+            errmsg += "<Timeout>"
+
+        scope_logger.error(errmsg)
 
     def sendMessage(self, mode, address, payload=None, Validate=False, maxResp=None, readMask=None):
-        """Send a message out the serial port"""
+        """Top level swiss-army knife method for sending a message.  Kept for back-compat
 
-        if payload is None:
-            payload = []
+        TODO: Transition API calls to use simplified API and remove this function...
+        """
+        address = self._address_str2int(address)
+        if mode != CODE_WRITE:
+            return self.msg_read(address, maxResp)
+        self.msg_write(address, payload)
+        if Validate:
+            self.msg_validate(address, payload, read_mask=readMask)
 
-        #Get length
-        length = len(payload)
+### Utility operations
 
-        if ((mode == CODE_WRITE) and (length < 1)) or ((mode == CODE_READ) and (length != 0)):
-            scope_logger.warning('Invalid payload for mode')
-            return None
+    def msg_get_value(self, address, i, max_resp=None):
+        """Gets a byte from the message response from the device.
 
-        if mode == CODE_READ:
-            self.flushInput()
+        Return:
+            The value of the specified byte.
+        """
+        address = self._address_str2int(address)
+        return self.msg_read(address, max_resp=max_resp)[i]
 
-        #Flip payload around
-        pba = bytearray(payload)
+    def msg_set_value(self, address, i, value, max_resp=None):
+        """Reads a response from the device, updates a byte in the response, and writes the
+        response back.
 
-        #Check if stream or newaechip mode expected
-        if hasattr(self.serial, "stream") and self.serial.stream is False:
-            #The serial interface is actually special USB Chip
-            if mode == CODE_READ:
-                if maxResp:
-                    datalen = maxResp
-                elif ADDR_ADCDATA == address:
-                    datalen = 65000
-                else:
-                    datalen = 1
+        Return:
+            The updated data that was written to the device.
+        """
+        address = self._address_str2int(address)
+        data = self.msg_read(address, max_resp=max_resp)
+        data[i] = value
+        self.msg_write(address, data)
+        return data
 
-                if self._fast_fifo_read_active and address != ADDR_ADCDATA:
-                    scope_logger.warning("Internal error: in fast read mode but not reading FIFO! (address=%0d, datalen=%0d)." % (address, datalen))
-                    scope_logger.warning("This happens when attempting to access (read or write) some Husky FPGA setting after the")
-                    scope_logger.warning("ADC sample FIFO read has been set up; in stream mode, this is done when scope.arm() is called.")
-                    scope_logger.warning("If this happens to you as a user: access scope.* settings before calling scope.arm(), not after.")
-                    scope_logger.warning("If this happens to you as a developer, you can resolve this by caching the setting you need.")
-                    scope_logger.warning("The error trace below will show you what led to this:")
-                    raise ValueError
+    def msg_extr_mask(self, address, i, mask, max_resp=None):
+        """Gets a byte from the message response and bitwise AND's a mask to it.
 
-                return bytearray(self.serial.cmdReadMem(address, datalen))
+        Return:
+            The masked value of the specified byte.
+        """
+        address = self._address_str2int(address)
+        return self.msg_get_value(address, i, max_resp=max_resp) & mask
 
-            else:
-                # Write output to memory
-                self.serial.cmdWriteMem(address, pba)
+    def msg_ins_mask(self, address, i, mask, value, max_resp=None):
+        """Reads a response from the device, bitwise NAND's a mask and bitwise OR's a value to a
+        byte, and writes the response back to the device.
 
-                # Check write was successful if validation requested
-                if Validate:
-                    check =  bytearray(self.serial.cmdReadMem(address, len(pba)))
+        Return:
+            The updated data that was written back to the device.
+        """
+        address = self._address_str2int(address)
+        data = self.msg_read(address, max_resp=max_resp)
+        data[i] = (data[i] & ~mask) | (value & mask)
+        self.msg_write(address, data)
+        return data
 
-                    if readMask:
-                        try:
-                            for i, m in enumerate(readMask):
-                                check[i] = check[i] & m
-                                pba[i] = pba[i] & m
-                        except IndexError:
-                            pass
+    def msg_extr_field(self, address, i, bfield, max_resp=None):
+        address = self._address_str2int(address)
+        return bfield.extr_value(self.msg_get_value(address, i, max_resp=max_resp))
 
-                    if check != pba:
-                        errmsg = "For address 0x%02x=%d" % (address, address)
-                        errmsg += "  Sent data: "
-                        for c in pba: errmsg += "%02x" % c
-                        errmsg += " Read data: "
-                        if check:
-                            for c in check: errmsg += "%02x" % c
-                        else:
-                            errmsg += "<Timeout>"
+    def msg_ins_field(self, address, i, bfield, value, max_resp=None):
+        address = self._address_str2int(address)
+        data = self.msg_read(address, max_resp=max_resp)
+        data[i] = bfield.ins_value(data[i], value)
+        self.msg_write(address, data)
+        return data
 
-                        scope_logger.error(errmsg)
-        else:
-            # ## Setup Message
-            message = bytearray([])
+    def msg_test_mask(self, address, i, mask, max_resp=None):
+        """Gets a masked byte from the message response and converts it to a bool.
 
-            # Message type
-            message.append(mode | address)
+        Return:
+            False if the result was 0, else True.
+        """
+        address = self._address_str2int(address)
+        return bool(self.msg_extr_mask(address, i, mask, max_resp=max_resp))
 
-            # Length
-            lenpayload = len(pba)
-            message.append(lenpayload & 0xff)
-            message.append((lenpayload >> 8) & 0xff)
+    def msg_match_mask(self, address, i, mask, max_resp=None):
+        """Gets a masked byte from the message response and converts it to a bool.
 
-            # append payload
-            message = message + pba
+        Return:
+            False if the result was 0, else True.
+        """
+        address = self._address_str2int(address)
+        return bool(self.msg_extr_mask(address, i, mask, max_resp=max_resp) == mask)
 
-            # ## Send out serial port
-            self.serial.write(message)
+    def msg_set_mask(self, address, i, mask, max_resp=None):
+        """Reads a response from the device, bitwise OR's a mask into a byte, and writes the
+        response back to the device.
 
-            # for b in message: print "%02x "%b,
-            # print ""
+        Return:
+            The updated data that was written back to the device.
+        """
+        address = self._address_str2int(address)
+        data = self.msg_read(address, max_resp=max_resp)
+        data[i] |= mask
+        self.msg_write(address, data)
+        return data
 
-            # ## Wait Response (if requested)
-            if mode == CODE_READ:
-                if maxResp:
-                    datalen = maxResp
-                elif ADDR_ADCDATA == address:
-                    datalen = 65000
-                else:
-                    datalen = 1
+    def msg_clr_mask(self, address, i, mask, max_resp=None):
+        """Reads a response from the device, bitwise NAND's a mask to a byte, and writes the
+        response back to the device.
 
-                result = self.serial.read(datalen)
+        Return:
+            The updated data that was written back to the device.
+        """
+        address = self._address_str2int(address)
+        data = self.msg_read(address, max_resp=max_resp)
+        data[i] &= ~mask
+        self.msg_write(address, data)
+        return data
 
-                # Check for timeout, if so abort
-                if len(result) < 1:
-                    self.flushInput()
-                    scope_logger.warning('Timeout in read: %d (address: 0x%02x)' % (len(result), address))
-                    return None
+    def msg_upd_mask(self, address, i, mask, set, max_resp=None):
+        """Reads a response from the device, conditionally bitwise OR's or NAND's a mask into a
+        byte, and writes the response back to the device.
 
-                rb = bytearray(result)
-
-                return rb
-            else:
-                if Validate:
-                    check = self.sendMessage(CODE_READ, address, maxResp=len(pba))
-
-                    if readMask:
-                        try:
-                            for i, m in enumerate(readMask):
-                                check[i] = check[i] & m
-                                pba[i] = pba[i] & m
-                        except IndexError:
-                            pass
-
-                    if check != pba:
-                        errmsg = "For address 0x%02x=%d" % (address, address)
-                        errmsg += "  Sent data: "
-                        for c in pba: errmsg += "%02x" % c
-                        errmsg += " Read data: "
-                        if check:
-                            for c in check: errmsg += "%02x" % c
-                        else:
-                            errmsg += "<Timeout>"
-
-                        scope_logger.error(errmsg)
+        Return:
+            The updated data that was written back to the device.
+        """
+        address = self._address_str2int(address)
+        if set:
+            return self.msg_set_mask(address, i, mask, max_resp=max_resp)
+        return self.msg_clr_mask(address, i, mask, max_resp=max_resp)
 
 ### Generic
     def fpga_write(self, address, data):
         """Helper function to write FPGA registers. Intended for development/debug, not for regular use.
         """
-        return self.sendMessage(CODE_WRITE, address, data)
+        address = self._address_str2int(address)
+        return self.msg_write(address, data)
 
     def fpga_read(self, address, num_bytes):
         """Helper function to read FPGA registers. Intended for development/debug, not for regular use.
         """
-        return self.sendMessage(CODE_READ, address, maxResp=num_bytes)
+        address = self._address_str2int(address)
+        return self.msg_read(address, maxResp=num_bytes)
 
     def reset_fpga(self):
         """ Reset all FPGA resgiters to their defaults.
         """
         if not self._is_husky:
             raise ValueError("For CW-Husky only.")
-        self.sendMessage(CODE_WRITE, ADDR_RESET, [1])
-        self.sendMessage(CODE_WRITE, ADDR_RESET, [0])
+        self.sendMessage(CODE_WRITE, "RESET", [1])
+        self.sendMessage(CODE_WRITE, "RESET", [0])
 
 
     def setSettings(self, state, validate=False):
         cmd = bytearray(1)
         cmd[0] = state
         self.cached_settings = state
-        self.sendMessage(CODE_WRITE, ADDR_SETTINGS, cmd, Validate=validate)
+        self.sendMessage(CODE_WRITE, "SETTINGS_ADDR", cmd, Validate=validate)
 
     def settings(self, use_cached=False):
         if (not use_cached) or (not self.cached_settings):
-            sets = self.sendMessage(CODE_READ, ADDR_SETTINGS)
+            sets = self.sendMessage(CODE_READ, "SETTINGS_ADDR")
             if sets is None:
                 self.cached_settings = 0
             else:
@@ -371,25 +464,25 @@ class OpenADCInterface(util.DisableNewAttr):
         self.setSettings(initial & ~SETTINGS_TRIG_NOW)
 
     def getStatus(self):
-        result = self.sendMessage(CODE_READ, ADDR_STATUS)
+        result = self.sendMessage(CODE_READ, "STATUS_ADDR")
 
         if len(result) == 1:
             return result[0]
         else:
             return None
 
-    def setNumSamples(self, samples):
-        self.sendMessage(CODE_WRITE, ADDR_SAMPLES, list(int.to_bytes(samples, length=4, byteorder='little')))
-        self.updateStreamBuffer(samples)
+    def setNumSamples(self, samples, segments=1):
+        self.sendMessage(CODE_WRITE, "SAMPLES_ADDR", list(int.to_bytes(samples, length=4, byteorder='little')))
+        self.updateStreamBuffer(samples*segments)
 
 
     def updateStreamBuffer(self, samples=None):
         # yes this is a bit weird but it is so:
         if samples is not None:
-            self._stream_len = samples
+            self._total_samples = samples
         if self._is_husky:
             if self._stream_mode:
-                sbuf_len = int(self._stream_len * self._bits_per_sample / 8)
+                sbuf_len = int(self._total_samples * self._bits_per_sample / 8)
                 if sbuf_len % 3:
                     # need to capture a multiple of 3 otherwise processHuskyData may fail
                     sbuf_len += 3 - sbuf_len % 3
@@ -399,6 +492,7 @@ class OpenADCInterface(util.DisableNewAttr):
                 self._stream_len = sbuf_len
         else:
             bufsizebytes = 0
+            self._stream_len = self._total_samples
             if self._stream_mode:
                 nae = self.serial
                 #Save the number we will return
@@ -413,13 +507,13 @@ class OpenADCInterface(util.DisableNewAttr):
         if decsamples <= 0 or decsamples >= 2**16 or not type(decsamples) is int:
             raise ValueError("Decsamples must be a positive 16-bit integer")
         decsamples -= 1
-        self.sendMessage(CODE_WRITE, ADDR_DECIMATE, list(int.to_bytes(decsamples, length=2, byteorder='little')))
+        self.sendMessage(CODE_WRITE, "DECIMATE_ADDR", list(int.to_bytes(decsamples, length=2, byteorder='little')))
 
 
     def decimate(self):
         if self._support_decimate:
             decnum = 0x00000000
-            temp = self.sendMessage(CODE_READ, ADDR_DECIMATE, maxResp=2)
+            temp = self.sendMessage(CODE_READ, "DECIMATE_ADDR", maxResp=2)
             #If we don't support decimate just return 1 in the future to avoid
             if temp:
                 decnum |= temp[0] << 0
@@ -435,18 +529,17 @@ class OpenADCInterface(util.DisableNewAttr):
     def set_clip_errors_disabled(self, disable):
         if not self._is_husky:
             raise ValueError("For CW-Husky only.")
-        raw = self.sendMessage(CODE_READ, ADDR_NO_CLIP_ERRORS, maxResp=1)[0]
+        raw = self.sendMessage(CODE_READ, "NO_CLIP_ERRORS", maxResp=1)[0]
         if disable:
             raw |= 1 # set bit 0
         else:
             raw &= 2 # clear bit 0
-        self.sendMessage(CODE_WRITE, ADDR_NO_CLIP_ERRORS, [raw])
-
+        self.sendMessage(CODE_WRITE, "NO_CLIP_ERRORS", [raw])
 
     def clip_errors_disabled(self):
         if not self._is_husky:
             raise ValueError("For CW-Husky only.")
-        if self.sendMessage(CODE_READ, ADDR_NO_CLIP_ERRORS, maxResp=1)[0] & 1:
+        if self.sendMessage(CODE_READ, "NO_CLIP_ERRORS", maxResp=1)[0] & 1:
             return True
         else:
             return False
@@ -454,25 +547,24 @@ class OpenADCInterface(util.DisableNewAttr):
     def set_lo_gain_errors_disabled(self, disable):
         if not self._is_husky:
             raise ValueError("For CW-Husky only.")
-        raw = self.sendMessage(CODE_READ, ADDR_NO_CLIP_ERRORS, maxResp=1)[0]
+        raw = self.sendMessage(CODE_READ, "NO_CLIP_ERRORS", maxResp=1)[0]
         if disable:
             raw |= 2 # set bit 1
         else:
             raw &= 1 # clear bit 1
-        self.sendMessage(CODE_WRITE, ADDR_NO_CLIP_ERRORS, [raw])
+        self.sendMessage(CODE_WRITE, "NO_CLIP_ERRORS", [raw])
 
     def lo_gain_errors_disabled(self):
         if not self._is_husky:
             raise ValueError("For CW-Husky only.")
-        if self.sendMessage(CODE_READ, ADDR_NO_CLIP_ERRORS, maxResp=1)[0] & 2:
+        if self.sendMessage(CODE_READ, "NO_CLIP_ERRORS", maxResp=1)[0] & 2:
             return True
         else:
             return False
 
-
     def numSamples(self):
         """Return the number of samples captured in one go. Returns max after resetting the hardware"""
-        temp = self.sendMessage(CODE_READ, ADDR_SAMPLES, maxResp=4)
+        temp = self.sendMessage(CODE_READ, "SAMPLES_ADDR", maxResp=4)
         samples = int.from_bytes(temp, byteorder='little')
         return samples
 
@@ -480,20 +572,20 @@ class OpenADCInterface(util.DisableNewAttr):
         """Return the maximum number of samples that can be captured in one go. Husky only."""
         if not self._is_husky:
             scope_logger.error("Supported by Husky only.")
-        return int.from_bytes(self.sendMessage(CODE_READ, ADDR_MAX_SAMPLES, maxResp=4), byteorder='little')
+        return int.from_bytes(self.sendMessage(CODE_READ, "MAX_SAMPLES_ADDR", maxResp=4), byteorder='little')
 
     def numMaxSegmentSamples(self):
         """Return the maximum number of samples that can be captured in one go when segmenting is used. Husky only."""
         if not self._is_husky:
             scope_logger.error("Supported by Husky only.")
-        return int.from_bytes(self.sendMessage(CODE_READ, ADDR_MAX_SEGMENT_SAMPLES, maxResp=4), byteorder='little')
+        return int.from_bytes(self.sendMessage(CODE_READ, "MAX_SEGMENT_SAMPLES_ADDR", maxResp=4), byteorder='little')
 
 
     def getBytesInFifo(self):
         if self._is_husky:
             scope_logger.error("Shouldn't be calling getBytesInFifo on Husky: associated register doesn't exist.")
         else:
-            temp = self.sendMessage(CODE_READ, ADDR_BYTESTORX, maxResp=4)
+            temp = self.sendMessage(CODE_READ, "RETSAMPLES_ADDR", maxResp=4)
             samples = int.from_bytes(temp, byteorder='little')
             return samples
 
@@ -519,10 +611,10 @@ class OpenADCInterface(util.DisableNewAttr):
         self.flushInput()
 
         #Send ping
-        self.sendMessage(CODE_WRITE, ADDR_ECHO, msgin)
+        self.sendMessage(CODE_WRITE, "ECHO_ADDR", msgin)
 
         #Pong?
-        msgout = self.sendMessage(CODE_READ, ADDR_ECHO)
+        msgout = self.sendMessage(CODE_READ, "ECHO_ADDR")
 
         if (msgout != msgin):
             return False
@@ -570,10 +662,10 @@ class OpenADCInterface(util.DisableNewAttr):
 
     def setFastFIFORead(self, active):
         if active:
-            self.sendMessage(CODE_WRITE, ADDR_FAST_FIFO_READ, [1])
+            self.sendMessage(CODE_WRITE, "FAST_FIFO_READ_MODE", [1])
             self._fast_fifo_read_active = True
         else:
-            self.sendMessage(CODE_WRITE, ADDR_FAST_FIFO_READ, [0])
+            self.sendMessage(CODE_WRITE, "FAST_FIFO_READ_MODE", [0])
             self._fast_fifo_read_active = False
 
     def startCaptureThread(self):
@@ -616,7 +708,7 @@ class OpenADCInterface(util.DisableNewAttr):
             scope_logger.debug("Streaming done, results: rx_bytes = %d"%(self._stream_rx_bytes))
             self.arm(False)
 
-            if self._is_husky and self.sendMessage(CODE_READ, ADDR_FIFO_STAT, maxResp=1)[0] & 0x0f:
+            if self._is_husky and self.sendMessage(CODE_READ, "FIFO_STAT", maxResp=1)[0] & 0x0f:
                 scope_logger.warning("FIFO error occured; see scope.adc.errors for details.")
 
             if stream_timeout:
@@ -649,7 +741,7 @@ class OpenADCInterface(util.DisableNewAttr):
         if self._is_husky and poll_done:
             # poll Husky to find out when the capture is complete:
             starttime = datetime.datetime.now()
-            while not self.sendMessage(CODE_READ, ADDR_CAPTURE_DONE, maxResp=1)[0]:
+            while not self.sendMessage(CODE_READ, "CAPTURE_DONE", maxResp=1)[0]:
                 diff = datetime.datetime.now() - starttime
                 if (diff.total_seconds() > self._timeout):
                     scope_logger.warning('Timeout in OpenADC capture() waiting for scope "done" to go high.')
@@ -668,14 +760,15 @@ class OpenADCInterface(util.DisableNewAttr):
 
             if offset == None:
                 offset = 0
-            time.sleep((offset+samples)/adc_freq)
+            if not timeout:
+                time.sleep((offset+samples)/adc_freq)
 
         self.arm(False) # <------ ADC will stop reading after this
         return timeout
 
     def flush(self):
         # Flush output FIFO
-        self.sendMessage(CODE_READ, ADDR_ADCDATA, None, False, None)
+        self.sendMessage(CODE_READ, "ADCREAD_ADDR", None, False, None)
 
     def readData(self, NumberPoints=None, progressDialog=None):
         scope_logger.debug("Reading data from OpenADC (NumberPoints=%d)..." % NumberPoints)
@@ -779,7 +872,7 @@ class OpenADCInterface(util.DisableNewAttr):
                 bytesToRead = min(hypBytes, bytesToRead)
 
                 # +1 for sync byte
-                data = self.sendMessage(CODE_READ, ADDR_ADCDATA, None, False, bytesToRead + 1)  # BytesPerPackage)
+                data = self.sendMessage(CODE_READ, "ADCREAD_ADDR", None, False, bytesToRead + 1)  # BytesPerPackage)
                 #print(data)
 
                 # for p in data:
@@ -802,6 +895,9 @@ class OpenADCInterface(util.DisableNewAttr):
                 return []
             if len(datapoints) > NumberPoints:
                 datapoints = datapoints[0:NumberPoints]
+
+            if len(self._int_data) > NumberPoints:
+                self._int_data = self._int_data[0:NumberPoints]
 
             # if len(datapoints) < NumberPoints:
             # print len(datapoints),
@@ -828,7 +924,7 @@ class OpenADCInterface(util.DisableNewAttr):
             if self._fast_fifo_read_enable:
                 # switch FPGA and SAM3U into fast read timing mode
                 self.setFastSMC(1)
-            data = self.sendMessage(CODE_READ, ADDR_ADCDATA, None, False, bytesToRead)
+            data = self.sendMessage(CODE_READ, "ADCREAD_ADDR", None, False, bytesToRead)
             # switch FPGA and SAM3U back to regular read timing mode
             if self._fast_fifo_read_enable:
                 scope_logger.debug("DISABLING fast fifo read")
@@ -930,6 +1026,7 @@ class OpenADCInterface(util.DisableNewAttr):
             self._int_data = np.array(fpData, dtype='int16')
             fpData = fpData / 1024.0 - self.offset
             scope_logger.debug("Trigger_data: {} len={}".format(trigger, len(trigger)))
+            scope_logger.debug("Unprocessed data, fpData: {}, int_data: {}".format(len(fpData), len(self._int_data)))
 
             # Search for the trigger signal
             trigfound = False
@@ -938,7 +1035,7 @@ class OpenADCInterface(util.DisableNewAttr):
                 if(t != 3):
                     trigfound = True
                     trigsamp = trigsamp + (t & 0x3)
-                    logging.debug("Trigger found at %d"%trigsamp)
+                    scope_logger.debug("Trigger found at %d"%trigsamp)
                     break
                 else:
                     trigsamp += 3
@@ -957,12 +1054,16 @@ class OpenADCInterface(util.DisableNewAttr):
         if diff > 0:
             #fpData = [pad]*diff + fpData
             fpData = np.append([pad]*diff, fpData)
+            self._int_data = np.append([0x00]*diff, self._int_data)
+            scope_logger.debug("Diff > 0, fpData: {}, int_data: {}".format(len(fpData), len(self._int_data)))
             scope_logger.warning('Pretrigger not met: Do not use downsampling and pretriggering at same time.')
             scope_logger.debug('Pretrigger not met: can attempt to increase presampleTempMargin(in the code).')
         else:
+            scope_logger.debug("Diff <= 0, fpData: {}, int_data: {}".format(len(fpData), len(self._int_data)))
             fpData = fpData[-diff:]
+            self._int_data = self._int_data[-diff:]
 
-        scope_logger.debug("Processed data, ended up with %d samples total"%len(fpData))
+        scope_logger.debug("Processed data, fpData: {}, int_data: {}".format(len(fpData), len(self._int_data)))
 
         return fpData
 
@@ -980,13 +1081,14 @@ class HWInformation(util.DisableNewAttr):
         self.disable_newattr()
 
     def versions(self):
-        result = self.oa.sendMessage(CODE_READ, ADDR_VERSIONS, maxResp=6)
+        result = self.oa.sendMessage(CODE_READ, "VERSION_ADDR", maxResp=6)
 
         regver = result[0] & 0xff
         hwtype = result[1] >> 3
         hwver = result[1] & 0x07
         hwList = ["Default/Unknown", "LX9 MicroBoard", "SASEBO-W", "ChipWhisperer Rev2 LX25",
-                  "Reserved?", "ZedBoard", "Papilio Pro", "SAKURA-G", "ChipWhisperer-Lite", "ChipWhisperer-CW1200","ChipWhisperer-Husky"]
+                  "Reserved?", "ZedBoard", "Papilio Pro", "SAKURA-G", "ChipWhisperer-Lite", "ChipWhisperer-CW1200", "ChipWhisperer-Husky",
+                  "ChipWhisperer-Husky-Plus"]
 
         try:
             textType = hwList[hwtype]
@@ -1020,7 +1122,7 @@ class HWInformation(util.DisableNewAttr):
     def is_cwhusky(self):
         if self.vers is None:
             self.versions()
-        if self.vers[1] == 10:
+        if self.vers[1] in (10,11):
             return True
         else:
             return False
@@ -1029,7 +1131,7 @@ class HWInformation(util.DisableNewAttr):
         """Returns date and time when FPGA bitfile was generated.
         """
         if self.is_cwhusky():
-            raw = self.oa.sendMessage(CODE_READ, ADDR_FPGA_BUILDTIME, maxResp=4)
+            raw = self.oa.sendMessage(CODE_READ, "FPGA_BUILDTIME_ADDR", maxResp=4)
             # definitions: Xilinx XAPP1232
             day = raw[3] >> 3
             month = ((raw[3] & 0x7) << 1) + (raw[2] >> 7)
@@ -1052,7 +1154,7 @@ class HWInformation(util.DisableNewAttr):
             return self.sysFreq
 
         '''Return the system clock frequency in specific firmware version'''
-        temp = self.oa.sendMessage(CODE_READ, ADDR_SYSFREQ, maxResp=4)
+        temp = self.oa.sendMessage(CODE_READ, "SYSTEMCLK_ADDR", maxResp=4)
         freq = int.from_bytes(temp, byteorder='little')
 
         self.sysFreq = int(freq)
@@ -1136,10 +1238,10 @@ class GainSettings(util.DisableNewAttr):
         """
         if self._is_husky:
             if gainmode == "high":
-                self.oa.sendMessage(CODE_WRITE, ADDR_HUSKY_VMAG_CTRL, [self._vmag_highgain])
+                self.oa.sendMessage(CODE_WRITE, "CW_VMAG_CTRL", [self._vmag_highgain])
                 self.gainlow_cached = False
             elif gainmode == "low":
-                self.oa.sendMessage(CODE_WRITE, ADDR_HUSKY_VMAG_CTRL, [self._vmag_lowgain])
+                self.oa.sendMessage(CODE_WRITE, "CW_VMAG_CTRL", [self._vmag_lowgain])
                 self.gainlow_cached = True
             else:
                 raise ValueError("Invalid Gain Mode, only 'low' or 'high' allowed")
@@ -1155,7 +1257,7 @@ class GainSettings(util.DisableNewAttr):
 
     def getMode(self):
         if self._is_husky:
-            if self.oa.sendMessage(CODE_READ, ADDR_HUSKY_VMAG_CTRL)[0] == self._vmag_highgain:
+            if self.oa.sendMessage(CODE_READ, "CW_VMAG_CTRL")[0] == self._vmag_highgain:
                 gain_high = True
             else:
                 gain_high = False
@@ -1200,13 +1302,13 @@ class GainSettings(util.DisableNewAttr):
         if (gain < 0) | (gain > maxgain):
             raise ValueError("Invalid Gain, range 0-%d only" % maxgain)
         self.gain_cached = gain
-        self.oa.sendMessage(CODE_WRITE, ADDR_GAIN, [gain])
+        self.oa.sendMessage(CODE_WRITE, "GAIN_ADDR", [gain])
         # allow time for the new gain to "settle":
         time.sleep(0.1)
 
     def getGain(self, cached=False):
         if cached == False:
-            self.gain_cached = self.oa.sendMessage(CODE_READ, ADDR_GAIN)[0]
+            self.gain_cached = self.oa.sendMessage(CODE_READ, "GAIN_ADDR")[0]
 
         return self.gain_cached
 
@@ -1296,29 +1398,6 @@ class GainSettings(util.DisableNewAttr):
 
         self.setGain(g)
 
-    def auto_gain(self, margin=20):
-        '''Increment gain until clipping occurs, then reduce by <margin> dB (default: 20 dB)
-
-        :meta private:
-        '''
-        if not self._is_husky:
-            raise ValueError("Only supported on Husky")
-        self.adc.clip_errors_disabled = False
-        self.adc.clear_clip_errors()
-        self.oa.sendMessage(CODE_WRITE, ADDR_CLIP_TEST, [1])
-        found = False
-        for gain in range(-15+margin, 65):
-            self.db = gain
-            if self.oa.sendMessage(CODE_READ, ADDR_FIFO_STAT, maxResp=1)[0] & 32:
-                self.db = gain - margin
-                found = True
-                self.adc.clear_clip_errors()
-                break
-        if not found:
-            scope_logger.warning("Couldn't clip ADC, using maximum gain")
-
-        self.oa.sendMessage(CODE_WRITE, ADDR_CLIP_TEST, [0])
-
 class TriggerSettings(util.DisableNewAttr):
     _name = 'Trigger Setup'
 
@@ -1332,8 +1411,6 @@ class TriggerSettings(util.DisableNewAttr):
         self.presampleTempMargin = 24
         self._timeout = 2
         self._stream_mode = False
-        self._stream_segment_size = 65536
-        self._stream_segment_threshold = 65536
         self._test_mode = False
         self._bits_per_sample = 10
         self._support_get_duration = True
@@ -1527,7 +1604,9 @@ class TriggerSettings(util.DisableNewAttr):
     def lo_gain_errors_disabled(self, disable):
         self.oa.set_lo_gain_errors_disabled(disable)
 
-
+    def disable_clip_and_lo_gain_errors(self, disabled):
+        self.lo_gain_errors_disabled = disabled
+        self.clip_errors_disabled = disabled
 
     @property
     def samples(self):
@@ -1558,13 +1637,36 @@ class TriggerSettings(util.DisableNewAttr):
                 scope_logger.warning("Sakura G samples must be divisible by 12, rounding up to {}...".format(samples))
 
         if self._get_fifo_fill_mode() == "segment":
-            diff = (3 - (samples - 1) % 3)
+            diff = ((3 - (samples - 1)) % 3)
             samples += diff
             if diff > 0:
                 scope_logger.warning("segment mode requires (samples-1) divisible by 3, rounding up to {}...".format(samples))
 
         self._cached_samples = samples
         self._set_num_samples(samples)
+
+    @property
+    def fifo_state(self):
+        """Husky only, for debugging; state of the Husky FIFO FSM.
+        """
+        if not self._is_husky:
+            raise ValueError("For CW-Husky only.")
+        state = self.oa.sendMessage(CODE_READ, "FIFO_STATE", maxResp=1)[0]
+        if state == 0:
+            return 'IDLE'
+        elif state == 1:
+            return 'PRESAMP_FILLING'
+        elif state == 2:
+            return 'PRESAMP_FULL'
+        elif state == 3:
+            return 'TRIGGERED'
+        elif state == 4:
+            return 'SEGMENT_DONE'
+        elif state == 5:
+            return 'DONE'
+        else:
+            raise ValueError("Unexpected value: %d" % state)
+
 
     @property
     def timeout(self):
@@ -1635,7 +1737,7 @@ class TriggerSettings(util.DisableNewAttr):
         self._cached_presamples = self._set_presamples(setting)
 
     @property
-    def basic_mode(self):
+    def basic_mode(self) -> str:
         """The type of event to use as a trigger.
 
         Only applies to the ADC capture - the glitch module
@@ -1667,7 +1769,7 @@ class TriggerSettings(util.DisableNewAttr):
         return param_alias[self._get_mode()]
 
     @basic_mode.setter
-    def basic_mode(self, mode):
+    def basic_mode(self, mode : str):
         api_alias = {
             "rising_edge": "rising edge",
             "falling_edge": "falling edge",
@@ -1680,7 +1782,7 @@ class TriggerSettings(util.DisableNewAttr):
         self._set_mode(api_alias[mode])
 
     @property
-    def trig_count(self):
+    def trig_count(self) -> int:
         """The number of samples that the trigger input was active.
 
         This value indicates how long the trigger was high or low last time
@@ -1695,7 +1797,7 @@ class TriggerSettings(util.DisableNewAttr):
         return self._get_duration()
 
     @property
-    def fifo_fill_mode(self):
+    def fifo_fill_mode(self) -> str:
         """The ADC buffer fill strategy - allows segmented usage for CW-lite and CW-pro.
 
         .. warning:: THIS REQUIRES NEW FPGA BITSTREAM - NOT YET IN THE PYTHON.
@@ -1708,11 +1810,11 @@ class TriggerSettings(util.DisableNewAttr):
         There are four possible modes:
          * "normal": Trigger line & logic work as expected.
          * "enable": Capture starts with rising edge, but writing samples
-                     is enabled by active-high state of trigger line.
+           is enabled by active-high state of trigger line.
          * "segment": Capture starts with rising edge, and writes `trigger.samples`
-                     to buffer on each rising edge, stopping when the buffer
-                     is full. For this to work adc.samples must be a multiple
-                     of 3 (will be enforced by API).
+           to buffer on each rising edge, stopping when the buffer
+           is full. For this to work adc.samples must be a multiple
+           of 3 (will be enforced by API).
 
         .. warning:: The "enable" and "segment" modes requires you to fill
                     the **full buffer** (~25K on CW-Lite, ~100K on CW-Pro).
@@ -1735,7 +1837,7 @@ class TriggerSettings(util.DisableNewAttr):
         return self._get_fifo_fill_mode()
 
     @fifo_fill_mode.setter
-    def fifo_fill_mode(self, mode):
+    def fifo_fill_mode(self, mode : str):
         known_modes = ["normal", "enable", "segment"]
         if mode not in known_modes:
             raise ValueError("Invalid fill mode %s. Valid modes: %s" % (mode, known_modes), mode)
@@ -1747,7 +1849,7 @@ class TriggerSettings(util.DisableNewAttr):
             self.samples = self.samples
 
     def _get_fifo_fill_mode(self):
-        result = self.oa.sendMessage(CODE_READ, ADDR_ADVCLK, maxResp=4)
+        result = self.oa.sendMessage(CODE_READ, "ADVCLOCK_ADDR", maxResp=4)
         mode = result[3] & 0x30
 
         if mode == 0x00:
@@ -1771,14 +1873,14 @@ class TriggerSettings(util.DisableNewAttr):
         else:
             raise ValueError("Invalid option for fifo mode: {}".format(mask))
 
-        result = self.oa.sendMessage(CODE_READ, ADDR_ADVCLK, maxResp=4)
+        result = self.oa.sendMessage(CODE_READ, "ADVCLOCK_ADDR", maxResp=4)
         result[3] &= ~(0x30)
         result[3] |= mask << 4
-        self.oa.sendMessage(CODE_WRITE, ADDR_ADVCLK, result, readMask= [0x3f, 0xff, 0xff, 0xfd])
+        self.oa.sendMessage(CODE_WRITE, "ADVCLOCK_ADDR", result, readMask= [0x3f, 0xff, 0xff, 0xfd])
 
 
     @property
-    def segments(self):
+    def segments(self) -> int:
         """Number of sample segments to capture.
 
         .. warning:: Supported by CW-Husky only. For segmenting on CW-lite or
@@ -1791,14 +1893,14 @@ class TriggerSettings(util.DisableNewAttr):
         Multiple segments are useful in two scenarios:
 
         #. Capturing only subsections of a power trace, to allow longer
-            effective captures.  After a trigger event, the requested number of
-            samples is captured every 'segment_cycles' clock cycles, 'segments'
-            times. Set 'segment_cycle_counter_en' to 1 for this segment mode.
+           effective captures.  After a trigger event, the requested number of
+           samples is captured every 'segment_cycles' clock cycles, 'segments'
+           times. Set 'segment_cycle_counter_en' to 1 for this segment mode.
         #. Speeding up capture times by capturing 'segments' power traces from
-            a single arm + capture event. Here, the requested number of samples
-            is captured at every trigger event, without having to re-arm and
-            download trace data between every trigger event. Set
-            'segment_cycle_counter_en' to 0 for this segment mode.
+           a single arm + capture event. Here, the requested number of samples
+           is captured at every trigger event, without having to re-arm and
+           download trace data between every trigger event. Set
+           'segment_cycle_counter_en' to 0 for this segment mode.
 
         .. warning:: when capturing multiple segments with presamples, the total number of samples 
             per segment must be a multiple of 3. Incorrect sample data will be obtained if this is not 
@@ -1818,7 +1920,7 @@ class TriggerSettings(util.DisableNewAttr):
 
 
     @segments.setter
-    def segments(self, num):
+    def segments(self, num : int):
         if num < 1 or num > 2**16-1 or not type(num) is int or not self._is_husky:
             raise ValueError("Number of segments must be in range [1, 2^16-1]. For CW-Husky only.")
         self._cached_segments = num
@@ -1829,44 +1931,46 @@ class TriggerSettings(util.DisableNewAttr):
             return 0
         elif not self._is_husky:
             return 1
-        cmd = self.oa.sendMessage(CODE_READ, ADDR_SEGMENTS, maxResp=2)
+        cmd = self.oa.sendMessage(CODE_READ, "NUM_SEGMENTS", maxResp=2)
         segments = int.from_bytes(cmd, byteorder='little')
         return segments
 
 
     def _set_segments(self, num):
-        self.oa.sendMessage(CODE_WRITE, ADDR_SEGMENTS, list(int.to_bytes(num, length=2, byteorder='little')))
+        self.oa.sendMessage(CODE_WRITE, "NUM_SEGMENTS", list(int.to_bytes(num, length=2, byteorder='little')))
+        # necessary for streaming to work:
+        self.oa.setNumSamples(self.samples, self.segments)
 
 
     @property
-    def errors(self):
+    def errors(self) -> Union[str, bool, int]:
         """Internal error flags (FPGA FIFO over/underflow)
 
         .. warning:: Supported by CW-Husky only.
 
         Error types and their causes:
             * 'presample error': capture trigger occurs before the requested
-                    number of presamples have been collected. Reduce 
-                    scope.adc.presamples or delay the capture trigger.
+              number of presamples have been collected. Reduce 
+              scope.adc.presamples or delay the capture trigger.
             * 'ADC clipped': gain is too high; reduce it (scope.gain) or disable 
-                    this error (scope.adc.clip_errors_disabled).
+              this error (scope.adc.clip_errors_disabled).
             * 'gain too low error': gain is "too low" (4 bits or more of the ADC's
-                    dynamic range did not get used); increase it (scope.gain) or 
-                    disable this error (scope.adc.lo_gain_errors_disabled).
+              dynamic range did not get used); increase it (scope.gain) or 
+              disable this error (scope.adc.lo_gain_errors_disabled).
             * 'invalid downsample setting': using downsampling (aka decimating) with
-                    presamples and multiple segments is not allowed.
+              presamples and multiple segments is not allowed.
             * 'segmenting error': the condition for starting the capture of the next
-                    segment came true before the capture of the current segment
-                    completed. Reduce the segment size and/or increase the time
-                    between segments.
+              segment came true before the capture of the current segment
+              completed. Reduce the segment size and/or increase the time
+              between segments.
             * 'fast FIFO underflow': shouldn't occur in isolation without
-                    other errors being flagged.
+              other errors being flagged.
             * 'fast FIFO overflow': data is coming in fast than it's being read;
-                    reduce scope.clock.adc_freq.
+              reduce scope.clock.adc_freq.
             * 'slow FIFO underflow': host tried to read more ADC samples than are
-                    available.
+              available.
             * 'slow FIFO overflow': data is coming in faster than it's being
-                    read; reduce scope.clock.adc_freq.
+              read; reduce scope.clock.adc_freq.
 
         To fully understand the four different FIFO errors (fast/slow
         over/underflows), some background on Husky's sample storage
@@ -1882,17 +1986,17 @@ class TriggerSettings(util.DisableNewAttr):
         :Setter: Clear error flags.
 
         """
-        return self._get_errors(ADDR_FIFO_STAT)
+        return self._get_errors("FIFO_STAT")
 
     @errors.setter
-    def errors(self, val):
+    def errors(self, val : Any):
         """Internal error flags (FPGA FIFO over/underflow)
 
         .. warning:: Supported by CW-Husky only.
 
         """
-        self.oa.sendMessage(CODE_WRITE, ADDR_FIFO_STAT, [1])
-        self.oa.sendMessage(CODE_WRITE, ADDR_FIFO_STAT, [0])
+        self.oa.sendMessage(CODE_WRITE, "FIFO_STAT", [1])
+        self.oa.sendMessage(CODE_WRITE, "FIFO_STAT", [0])
 
 
     @property
@@ -1906,11 +2010,11 @@ class TriggerSettings(util.DisableNewAttr):
         """
         if not self._is_husky:
             raise ValueError("For CW-Husky only.")
-        return self._get_errors(ADDR_FIFO_FIRST_ERROR)
+        return self._get_errors("FIFO_FIRST_ERROR")
 
 
     @property
-    def first_error_state(self):
+    def first_error_state(self) -> str:
         """Reports the state the FPGA FSM state at the time of the first flagged error. Useful for debugging. Read-only.
 
         .. warning:: Supported by CW-Husky only.
@@ -1920,7 +2024,7 @@ class TriggerSettings(util.DisableNewAttr):
         """
         if not self._is_husky:
             raise ValueError("For CW-Husky only.")
-        raw = self.oa.sendMessage(CODE_READ, ADDR_FIFO_FIRST_ERROR_STATE, maxResp=1)[0]
+        raw = self.oa.sendMessage(CODE_READ, "FIFO_FIRST_ERROR", maxResp=3)[2]
         if   raw == 0: return "IDLE"
         elif raw == 1: return "PRESAMP_FILLING"
         elif raw == 2: return "PRESAMP_FULL"
@@ -1945,13 +2049,19 @@ class TriggerSettings(util.DisableNewAttr):
         if raw[0] & 64:  stat += 'invalid downsample setting, '
         if raw[0] & 128: stat += 'segmenting error, '
         if raw[1] & 1:   stat += 'gain too low error, '
+        if raw[1] & 2:   stat += 'trigger too soon error, '
+        if self._is_pro:
+            if raw[1] & 4:   stat += 'pre-DDR FIFO underflow, '
+            if raw[1] & 8:   stat += 'pre-DDR FIFO overflow, '
+            if raw[1] & 16:  stat += 'reading too soon, '
+            if raw[1] & 32:  stat += 'DDR full, '
         if stat == '':
             stat = False
         return stat
 
 
     @property
-    def segment_cycles(self):
+    def segment_cycles(self) -> int:
         """Number of clock cycles separating segments.
 
         .. warning:: Supported by CW-Husky only. For segmenting on CW-lite or
@@ -1968,7 +2078,9 @@ class TriggerSettings(util.DisableNewAttr):
         scope.adc.samples. If they are too close, capture will fail (indicated by
         the blinking red lights and scope.adc.errors showing either a
         segmenting error or a FIFO over/underflow error). 
+
         When presamples = 0, segment_cycles >= samples + 10.
+
         When presamples > 0, segment_cycles >= samples + presamples AND segment_cycles >= samples + 10.
 
         :Getter: Return the current value of segment_cycles.
@@ -1984,7 +2096,7 @@ class TriggerSettings(util.DisableNewAttr):
         return self._cached_segment_cycles
 
     @segment_cycles.setter
-    def segment_cycles(self, num):
+    def segment_cycles(self, num : int):
         if num < 0 or num > 2**20-1 or not type(num) is int or not self._is_husky:
             raise ValueError("Number of segments must be in range [0, 2^20-1]. For CW-Husky only.")
         self._cached_segment_cycles = num
@@ -1996,18 +2108,18 @@ class TriggerSettings(util.DisableNewAttr):
         elif not self._is_husky:
             return 0
 
-        cmd = self.oa.sendMessage(CODE_READ, ADDR_SEGMENT_CYCLES, maxResp=3)
+        cmd = self.oa.sendMessage(CODE_READ, "SEGMENT_CYCLES", maxResp=3)
         segment_cycles = int.from_bytes(cmd, byteorder='little')
         return segment_cycles
 
 
     def _set_segment_cycles(self, num):
-        self.oa.sendMessage(CODE_WRITE, ADDR_SEGMENT_CYCLES, list(int.to_bytes(num, length=3, byteorder='little')))
+        self.oa.sendMessage(CODE_WRITE, "SEGMENT_CYCLES", list(int.to_bytes(num, length=3, byteorder='little')))
 
 
 
     @property
-    def segment_cycle_counter_en(self):
+    def segment_cycle_counter_en(self) -> bool:
         """Number of clock cycles separating segments.
 
         .. warning:: Supported by CW-Husky only. For segmenting on CW-lite or
@@ -2025,7 +2137,7 @@ class TriggerSettings(util.DisableNewAttr):
         """
         if not self._is_husky:
             raise ValueError("For CW-Husky only.")
-        raw = self.oa.sendMessage(CODE_READ, ADDR_SEGMENT_CYCLE_COUNTER_EN, Validate=False, maxResp=1)[0]
+        raw = self.oa.sendMessage(CODE_READ, "SEGMENT_CYCLE_COUNTER_EN", Validate=False, maxResp=1)[0]
         if raw == 1:
             return True
         elif raw == 0:
@@ -2034,25 +2146,27 @@ class TriggerSettings(util.DisableNewAttr):
             raise ValueError("Unexpected: read %d" % raw)
 
     @segment_cycle_counter_en.setter
-    def segment_cycle_counter_en(self, enable):
+    def segment_cycle_counter_en(self, enable : bool):
         if enable:
             val = [1]
         else:
             val = [0]
-        self.oa.sendMessage(CODE_WRITE, ADDR_SEGMENT_CYCLE_COUNTER_EN, val, Validate=False)
+        self.oa.sendMessage(CODE_WRITE, "SEGMENT_CYCLE_COUNTER_EN", val, Validate=False)
 
 
 
     def _set_stream_mode(self, enabled):
+        if self._is_lite:
+            raise ValueError("Not supported on CW-Lite.")
         self._stream_mode = enabled
 
         #Write to FPGA
-        base = self.oa.sendMessage(CODE_READ, ADDR_SETTINGS)[0]
+        base = self.oa.sendMessage(CODE_READ, "SETTINGS_ADDR")[0]
         if enabled:
             val = base | (1<<4)
         else:
             val = base & ~(1<<4)
-        self.oa.sendMessage(CODE_WRITE, ADDR_SETTINGS, [val])
+        self.oa.sendMessage(CODE_WRITE, "SETTINGS_ADDR", [val])
 
         #Notify capture system
         self.oa.setStreamMode(enabled)
@@ -2063,35 +2177,37 @@ class TriggerSettings(util.DisableNewAttr):
 
     def _set_stream_segment_threshold(self, size):
         scope_logger.warning('Changing this parameter can degrade performance and/or cause reads to fail entirely; use at your own risk.')
-        self._stream_segment_threshold = size
         #Write to FPGA
-        self.oa.sendMessage(CODE_WRITE, ADDR_STREAM_SEGMENT_THRESHOLD, list(int.to_bytes(size, length=3, byteorder='little')))
+        self.oa.sendMessage(CODE_WRITE, "STREAM_SEGMENT_THRESHOLD", list(int.to_bytes(size, length=3, byteorder='little')))
 
 
     def _set_stream_segment_size(self, size):
         scope_logger.warning('Changing this parameter can degrade performance and/or cause reads to fail entirely; use at your own risk.')
-        self._stream_segment_size = size
         #Notify capture system
         self.oa.setStreamSegmentSize(size)
 
 
     def _get_stream_segment_threshold(self):
-        raw = self.oa.sendMessage(CODE_READ, ADDR_STREAM_SEGMENT_THRESHOLD, maxResp=3)
+        raw = self.oa.sendMessage(CODE_READ, "STREAM_SEGMENT_THRESHOLD", maxResp=3)
         return int.from_bytes(raw, byteorder='little')
 
     def _get_stream_segment_size(self):
-        return self._stream_segment_size
+        return self.oa._stream_segment_size
 
     def _set_test_mode(self, enabled):
         self._test_mode = enabled
         if enabled:
-            self.oa.sendMessage(CODE_WRITE, ADDR_DATA_SOURCE, [0])
-            self.oa.sendMessage(CODE_WRITE, ADDR_NO_CLIP_ERRORS, [1])
+            fifo_config = self.oa.sendMessage(CODE_READ, "FIFO_CONFIG", maxResp=1)[0]
+            fifo_config &= 0b11111101
+            self.oa.sendMessage(CODE_WRITE, "FIFO_CONFIG", [fifo_config])
+            self.oa.sendMessage(CODE_WRITE, "NO_CLIP_ERRORS", [1])
             if self._bits_per_sample == 8:
-                self.oa.sendMessage(CODE_WRITE, ADDR_ADC_LOW_RES, [3]) # store LSB instead of MSB
+                self.oa.sendMessage(CODE_WRITE, "ADC_LOW_RES", [3]) # store LSB instead of MSB
         else:
-            self.oa.sendMessage(CODE_WRITE, ADDR_DATA_SOURCE, [1])
-            self.oa.sendMessage(CODE_WRITE, ADDR_NO_CLIP_ERRORS, [0])
+            fifo_config = self.oa.sendMessage(CODE_READ, "FIFO_CONFIG", maxResp=1)[0]
+            fifo_config |= 0b00000010
+            self.oa.sendMessage(CODE_WRITE, "FIFO_CONFIG", [fifo_config])
+            self.oa.sendMessage(CODE_WRITE, "NO_CLIP_ERRORS", [0])
             self.bits_per_sample = self._bits_per_sample #shorthand to clear the LSB setting
 
 
@@ -2129,17 +2245,17 @@ class TriggerSettings(util.DisableNewAttr):
                 val = 1
         else:
             val = 0
-        self.oa.sendMessage(CODE_WRITE, ADDR_ADC_LOW_RES, [val])
+        self.oa.sendMessage(CODE_WRITE, "ADC_LOW_RES", [val])
         # Notify capture system:
         self.oa.setBitsPerSample(bits)
         # necessary for streaming to work:
-        self.oa.setNumSamples(self.samples)
+        self.oa.setNumSamples(self.samples, self.segments)
 
     def _get_bits_per_sample(self):
         return self._bits_per_sample
 
     @property
-    def bits_per_sample(self):
+    def bits_per_sample(self) -> int:
         """Bits per ADC sample. Only available on CW-Husky.
 
         Husky has a 12-bit ADC; optionally, we read back only 8 bits per
@@ -2153,9 +2269,11 @@ class TriggerSettings(util.DisableNewAttr):
         return self._get_bits_per_sample()
 
     @bits_per_sample.setter
-    def bits_per_sample(self, bits):
+    def bits_per_sample(self, bits : int):
         if bits not in [8,12]:
             raise ValueError("Valid settings: 8 or 12.")
+        if not self._is_husky:
+            raise ValueError('For CW-Husky only.')
         self._set_bits_per_sample(bits)
 
 
@@ -2174,15 +2292,19 @@ class TriggerSettings(util.DisableNewAttr):
     def clear_clip_errors(self):
         """ADC clipping errors are sticky until manually cleared by calling this.
         """
-        self.oa.sendMessage(CODE_WRITE, ADDR_FIFO_STAT, [1])
-        self.oa.sendMessage(CODE_WRITE, ADDR_FIFO_STAT, [0])
+        self.oa.sendMessage(CODE_WRITE, "FIFO_STAT", [1])
+        self.oa.sendMessage(CODE_WRITE, "FIFO_STAT", [0])
 
     def _set_num_samples(self, samples):
         if samples < 0 or not type(samples) is int:
             raise ValueError("Samples must be a positive integer")
         if self._is_husky and samples < 7:
             scope_logger.warning('There may be issues with this few samples on Husky; a minimum of 7 samples is recommended')
-        self.oa.setNumSamples(samples)
+        if self._is_husky:
+            segments = self.segments
+        else:
+            segments = 1
+        self.oa.setNumSamples(samples, segments)
 
     def _get_num_samples(self):
         if self.oa is None:
@@ -2198,7 +2320,7 @@ class TriggerSettings(util.DisableNewAttr):
         """
         if self.oa is None or not self._is_husky:
             return 0
-        return self.oa.sendMessage(CODE_READ, ADDR_FIFO_UNDERFLOW_COUNT, maxResp=1)[0]
+        return self.oa.sendMessage(CODE_READ, "FIFO_UNDERFLOW_COUNT", maxResp=1)[0]
 
 
     def _set_timeout(self, timeout):
@@ -2212,20 +2334,20 @@ class TriggerSettings(util.DisableNewAttr):
     def _set_offset(self,  offset):
         if offset < 0 or offset >= 2**32 or not type(offset) is int:
             raise ValueError("Offset must be a non-negative 32-bit unsigned integer")
-        self.oa.sendMessage(CODE_WRITE, ADDR_OFFSET, list(int.to_bytes(offset, length=4, byteorder='little')))
+        self.oa.sendMessage(CODE_WRITE, "OFFSET_ADDR", list(int.to_bytes(offset, length=4, byteorder='little')))
 
     def _get_offset(self):
         if self.oa is None:
             return 0
 
-        cmd = self.oa.sendMessage(CODE_READ, ADDR_OFFSET, maxResp=4)
+        cmd = self.oa.sendMessage(CODE_READ, "OFFSET_ADDR", maxResp=4)
         offset = int.from_bytes(cmd, byteorder='little')
         return offset
 
     def _set_presamples(self, samples):
         if self._is_husky:
             min_samples = 8
-            max_samples = min(self.samples, 32767)
+            max_samples = min(self.samples-2, 32767)
             presamp_bytes = 2
             if self.decimate > 1:
                 raise Warning("Decimating with presamples is not supported on Husky.")
@@ -2262,7 +2384,7 @@ class TriggerSettings(util.DisableNewAttr):
 
             self.presamples_actual = samplesact * 3
 
-        self.oa.sendMessage(CODE_WRITE, ADDR_PRESAMPLES, list(int.to_bytes(samplesact, length=presamp_bytes, byteorder='little')))
+        self.oa.sendMessage(CODE_WRITE, "PRESAMPLES_ADDR", list(int.to_bytes(samplesact, length=presamp_bytes, byteorder='little')))
 
 
         #print "Requested presamples: %d, actual: %d"%(samples, self.presamples_actual)
@@ -2284,7 +2406,7 @@ class TriggerSettings(util.DisableNewAttr):
         else:
             presamp_bytes = 4
 
-        temp = self.oa.sendMessage(CODE_READ, ADDR_PRESAMPLES, maxResp=presamp_bytes)
+        temp = self.oa.sendMessage(CODE_READ, "PRESAMPLES_ADDR", maxResp=presamp_bytes)
         samples = int.from_bytes(temp, byteorder='little')
 
         #CW1200/CW-Lite/Husky reports presamples using different method
@@ -2347,7 +2469,7 @@ class TriggerSettings(util.DisableNewAttr):
 
         if self._support_get_duration:
 
-            temp = self.oa.sendMessage(CODE_READ, ADDR_TRIGGERDUR, maxResp=4)
+            temp = self.oa.sendMessage(CODE_READ, "TRIGGER_DUR_ADDR", maxResp=4)
 
             #Old versions don't support this feature
             if temp is None:
@@ -2365,22 +2487,16 @@ class ClockSettings(util.DisableNewAttr):
     _name = 'Clock Setup'
     _readMask = [0x1f, 0xff, 0xff, 0xfd]
 
-    def __init__(self, oaiface : OpenADCInterface, hwinfo=None):
-        from .cwhardware.ChipWhispererHuskyMisc import XilinxDRP, XilinxMMCMDRP
+    def __init__(self, oaiface : OpenADCInterface, hwinfo=None, is_husky=False):
         super().__init__()
         self.oa = oaiface
         self._hwinfo = hwinfo
         self._freqExt = 10e6
-        self._is_husky = False
         self._cached_adc_freq = None
-        self.drp = XilinxDRP(oaiface, ADDR_CLKGEN_DRP_DATA, ADDR_CLKGEN_DRP_ADDR, ADDR_CLKGEN_DRP_RESET)
-        self.mmcm = XilinxMMCMDRP(self.drp)
         self.disable_newattr()
 
     def _dict_repr(self):
         rtn = OrderedDict()
-        if self._is_husky:
-            rtn['enabled'] = self.enabled
         rtn['adc_src']    = self.adc_src
         rtn['adc_phase']  = self.adc_phase
         rtn['adc_freq']   = self.adc_freq
@@ -2406,35 +2522,16 @@ class ClockSettings(util.DisableNewAttr):
         return self.__repr__()
 
     @property
-    def enabled(self):
-        """Controls whether the Xilinx MMCM used to generate the target clock
-        is powered on or not. In Husky, an external PLL is used instead; this
-        FPGA PLL is still present but disabled by default because MMCMs are
-        quite power-hungry.
-
-        """
-        if not self._is_husky:
-            raise ValueError("For CW-Husky only.")
-        return self._getEnabled()
-
-    @enabled.setter
-    def enabled(self, enable):
-        if not self._is_husky:
-            raise ValueError("For CW-Husky only.")
-        self._setEnabled(enable)
-
-
-    @property
-    def adc_src(self):
+    def adc_src(self) -> str:
         """The clock source for the ADC module.
 
         The ADC can be clocked by one of five possible sources:
 
-         * "clkgen_x1": CLKGEN output via DCM
-         * "clkgen_x4": CLKGEN output via DCM with x4 clk multiplier
-         * "extclk_x1": External clock input via DCM
-         * "extclk_x4": External clock input via DCM with x4 clk multiplier
-         * "extclk_dir": External clock input with no DCM
+        * "clkgen_x1": CLKGEN output via DCM
+        * "clkgen_x4": CLKGEN output via DCM with x4 clk multiplier
+        * "extclk_x1": External clock input via DCM
+        * "extclk_x4": External clock input via DCM with x4 clk multiplier
+        * "extclk_dir": External clock input with no DCM
 
         :Getter: Return the current ADC clock source (one of five strings above)
 
@@ -2451,7 +2548,7 @@ class ClockSettings(util.DisableNewAttr):
             return ret
 
     @adc_src.setter
-    def adc_src(self, src):
+    def adc_src(self, src : str):
         # We need to pass a tuple into _setAdcSource() so the ADC source
         # parameter recognizes this input
         self._cached_adc_freq = None
@@ -2471,7 +2568,7 @@ class ClockSettings(util.DisableNewAttr):
         self.reset_adc()
 
     @property
-    def adc_phase(self):
+    def adc_phase(self) -> int:
         """Fine adjustment for the ADC sampling point.
 
         This setting moves the sampling point approximately 5 ns forward or
@@ -2487,40 +2584,40 @@ class ClockSettings(util.DisableNewAttr):
         :Setter: Set a new phase offset
 
         Raises:
-           ValueError: if offset not in [-32767, 32767] (Husky) or [-255, 255] (others)
+           ValueError: if offset not in [-255, 255]
            TypeError: if offset not integer
         """
         return self._get_phase()
 
     @adc_phase.setter
-    def adc_phase(self, phase):
+    def adc_phase(self, phase : int):
         self._set_phase(phase)
 
     @property
-    def adc_freq(self):
+    def adc_freq(self) -> int:
         """The current frequency of the ADC clock in Hz. Read-only.
 
         This clock frequency is derived from one of the ADC clock sources as
         described in adc_src.
 
-        :Getter: Return the current frequency in MHz (float). May take
+        :Getter: Return the current frequency in Hz (int). May take
                 up to 0.5s to stabilize after adc_locked is True.
         """
         return self._getAdcFrequency()
 
     @property
-    def adc_rate(self):
+    def adc_rate(self) -> int:
         """The current sampling rate of the ADC clock in samples/s. Read-only.
 
         Note that the sampling rate may be less than the clock frequency if
         the downsampling factor is greater than 1.
 
-        :Getter: Return the current sampling rate in MS/s (float)
+        :Getter: Return the current sampling rate in samples/s (float)
         """
         return self._adcSampleRate()
 
     @property
-    def adc_locked(self):
+    def adc_locked(self) -> bool:
         """The current status of the ADC DCM. Read-only.
 
         To try re-locking the ADC, see reset_adc().
@@ -2530,19 +2627,19 @@ class ClockSettings(util.DisableNewAttr):
         return self._get_adcclk_locked()
 
     @property
-    def freq_ctr(self):
-        """The current frequency at the frequency counter in MHz. Read-only.
+    def freq_ctr(self) -> int:
+        """The current frequency at the frequency counter in Hz. Read-only.
 
         The frequency counter can be used to check the speed of the CLKGEN
         output or the EXTCLK input. This value shows the current frequency
         reading.
 
-        :Getter: Return the current frequency in MHz (float)
+        :Getter: Return the current frequency in Hz (int)
         """
         return self._get_extfrequency()
 
     @property
-    def freq_ctr_src(self):
+    def freq_ctr_src(self) -> str:
         """The current input to the frequency counter.
 
         There are two possible inputs to the frequency counter:
@@ -2565,7 +2662,7 @@ class ClockSettings(util.DisableNewAttr):
             raise IOError("Invalid clock source reported by hardware: %d"%src)
 
     @freq_ctr_src.setter
-    def freq_ctr_src(self, src):
+    def freq_ctr_src(self, src : str):
         if src == "clkgen":
             s = 1
         elif src == "extclk":
@@ -2575,7 +2672,7 @@ class ClockSettings(util.DisableNewAttr):
         self._set_freqcounter_src(s)
 
     @property
-    def clkgen_src(self):
+    def clkgen_src(self) -> str:
         """The input source for the CLKGEN DCM.
 
         This DCM can receive input from one of two places:
@@ -2593,7 +2690,7 @@ class ClockSettings(util.DisableNewAttr):
         return self._get_clkgen_src()
 
     @clkgen_src.setter
-    def clkgen_src(self, src):
+    def clkgen_src(self, src : str):
         if src == "extclk":
             self._set_clkgen_src("extclk")
         elif src == "system" or src == "internal":
@@ -2604,7 +2701,7 @@ class ClockSettings(util.DisableNewAttr):
         self.reset_dcms()
 
     @property
-    def extclk_freq(self):
+    def extclk_freq(self) -> int:
         """The input frequency from the EXTCLK source in Hz.
 
         This value is used to help calculate the correct CLKGEN settings to
@@ -2619,11 +2716,11 @@ class ClockSettings(util.DisableNewAttr):
         return int(self._get_extclk_freq())
 
     @extclk_freq.setter
-    def extclk_freq(self, freq):
+    def extclk_freq(self, freq : int):
         self._set_extclk_freq(freq)
 
     @property
-    def clkgen_freq(self):
+    def clkgen_freq(self) -> str:
         """The CLKGEN output frequency in Hz.
 
         The CLKGEN module takes the input source and multiplies/divides it to
@@ -2652,7 +2749,7 @@ class ClockSettings(util.DisableNewAttr):
         self.reset_dcms()
 
     @property
-    def clkgen_locked(self):
+    def clkgen_locked(self) -> bool:
         """The current status of the CLKGEN DCM. Read-only.
 
         :Getter: Return whether the CLKGEN DCM is locked (True or False)
@@ -2660,16 +2757,16 @@ class ClockSettings(util.DisableNewAttr):
         return self._getClkgenLocked()
 
     def _set_freqcounter_src(self, src):
-        result = self.oa.sendMessage(CODE_READ, ADDR_ADVCLK, maxResp=4)
+        result = self.oa.sendMessage(CODE_READ, "ADVCLOCK_ADDR", maxResp=4)
         result[3] &= ~0x08
         result[3] |= src << 3
         #print "%x"%result[3]
-        self.oa.sendMessage(CODE_WRITE, ADDR_ADVCLK, result, readMask=self._readMask)
+        self.oa.sendMessage(CODE_WRITE, "ADVCLOCK_ADDR", result, readMask=self._readMask)
 
     def _get_freqcounter_src(self):
         if self.oa is None:
             return 0
-        result = self.oa.sendMessage(CODE_READ, ADDR_ADVCLK, maxResp=4)
+        result = self.oa.sendMessage(CODE_READ, "ADVCLOCK_ADDR", maxResp=4)
         return (result[3] & 0x08) >> 3
 
     #def _getClkgenStr(self):
@@ -2746,7 +2843,7 @@ class ClockSettings(util.DisableNewAttr):
 
 
     @property
-    def clkgen_mul(self):
+    def clkgen_mul(self) -> int:
         """The multiplier in the CLKGEN DCM.
 
         This multiplier must be in the range [2, 256].
@@ -2758,62 +2855,48 @@ class ClockSettings(util.DisableNewAttr):
         return self._getClkgenMul()
 
     @clkgen_mul.setter
-    def clkgen_mul(self, mul):
+    def clkgen_mul(self, mul : int):
         self._setClkgenMulWrapper(mul)
 
     def _getClkgenMul(self):
         timeout = 2
         while timeout > 0:
-            if self.oa.hwInfo.is_cwhusky():
-                return self._get_husky_clkgen_mul()
+            result = self.oa.sendMessage(CODE_READ, "ADVCLOCK_ADDR", maxResp=4)
+            val = result[1]
+            if val == 0:
+                val = 1  # Fix incorrect initialization on FPGA
+                self._setClkgenMul(2)
+            val += 1
 
-            else:
-                result = self.oa.sendMessage(CODE_READ, ADDR_ADVCLK, maxResp=4)
-                val = result[1]
-                if val == 0:
-                    val = 1  # Fix incorrect initialization on FPGA
-                    self._setClkgenMul(2)
-                val += 1
+            if (result[3] & 0x02):
+                return val
 
-                if (result[3] & 0x02):
-                    return val
+            self._clkgenLoad()
 
-                self._clkgenLoad()
-
-                timeout -= 1
+            timeout -= 1
 
         # raise IOError("clkgen never loaded value?")
         return 0
 
 
     def _setClkgenMulWrapper(self, mul):
-        if self.oa.hwInfo.is_cwhusky():
-            self._set_husky_clkgen_mul(mul)
-        else:
-            # TODO: raise ValueError?
-            if mul < 2:
-                mul = 2
-            self._setClkgenMul(mul)
+        # TODO: raise ValueError?
+        if mul < 2:
+            mul = 2
+        self._setClkgenMul(mul)
 
     def _setClkgenMul(self, mul):
-        result = self.oa.sendMessage(CODE_READ, ADDR_ADVCLK, maxResp=4)
+        result = self.oa.sendMessage(CODE_READ, "ADVCLOCK_ADDR", maxResp=4)
         mul -= 1
         result[1] = mul
         result[3] |= 0x01
-        self.oa.sendMessage(CODE_WRITE, ADDR_ADVCLK, result, readMask=self._readMask)
+        self.oa.sendMessage(CODE_WRITE, "ADVCLOCK_ADDR", result, readMask=self._readMask)
         result[3] &= ~(0x01)
-        self.oa.sendMessage(CODE_WRITE, ADDR_ADVCLK, result, readMask=self._readMask)
-
-
-    def _set_husky_clkgen_mul(self, mul):
-        # calculate register value:
-        if type(mul) != int:
-            raise ValueError("Only integers are supported")
-        self.mmcm.set_mul(mul)
+        self.oa.sendMessage(CODE_WRITE, "ADVCLOCK_ADDR", result, readMask=self._readMask)
 
 
     @property
-    def clkgen_div(self):
+    def clkgen_div(self) -> int:
         """The divider in the CLKGEN DCM.
 
         This divider must be in the range [1, 256].
@@ -2825,78 +2908,46 @@ class ClockSettings(util.DisableNewAttr):
         return self._getClkgenDiv()
 
     @clkgen_div.setter
-    def clkgen_div(self, div):
-        if self.oa.hwInfo.is_cwhusky():
-            # Husky PLL takes two dividers; if only one was provided, set the other to 1
-            if type(div) == int:
-                div = [div, 1]
-            self._set_husky_clkgen_div(div)
-        else:
-            self._setClkgenDivWrapper(div)
+    def clkgen_div(self, div : Union[int, List[int]]):
+        self._setClkgenDivWrapper(div)
 
     def _getClkgenDiv(self):
         if self.oa is None:
             return 2
         timeout = 2
         while timeout > 0:
-            if self.oa.hwInfo.is_cwhusky():
-                return self._get_husky_clkgen_div()
-
-            else:
-                result = self.oa.sendMessage(CODE_READ, ADDR_ADVCLK, maxResp=4)
+            result = self.oa.sendMessage(CODE_READ, "ADVCLOCK_ADDR", maxResp=4)
+            if (result[3] & 0x02):
+                # Done loading value yet
                 val = result[2]
                 val += 1
+                return val
 
-                if (result[3] & 0x02):
-                    # Done loading value yet
-                    return val
+            self._clkgenLoad()
 
-                self._clkgenLoad()
-
-                timeout -= 1
+            timeout -= 1
 
         scope_logger.error("CLKGEN Failed to load divider value. Most likely clock input to CLKGEN is stopped, check CLKGEN"
                       " source settings. CLKGEN clock results are currently invalid.")
         return 1
 
 
-
-    def _set_husky_clkgen_div(self, div):
-        main_div = div[0]
-        sec_div = div[1]
-        self.mmcm.set_main_div(div[0])
-        self.mmcm.set_sec_div(div[1],0)
-
-
     def _setClkgenDivWrapper(self, div):
-        if self.oa.hwInfo.is_cwhusky():
-            self._set_husky_clkgen_div(div)
-        else:
-            if hasattr(div, "__getitem__"):
-                div = div[0]
-            if div < 1:
-                div = 1
+        if hasattr(div, "__getitem__"):
+            div = div[0]
+        if div < 1:
+            div = 1
 
-            result = self.oa.sendMessage(CODE_READ, ADDR_ADVCLK, maxResp=4)
-            div -= 1
-            result[2] = div
-            result[3] |= 0x01
-            self.oa.sendMessage(CODE_WRITE, ADDR_ADVCLK, result, readMask=self._readMask)
-            result[3] &= ~(0x01)
-            self.oa.sendMessage(CODE_WRITE, ADDR_ADVCLK, result, readMask=self._readMask)
+        result = self.oa.sendMessage(CODE_READ, "ADVCLOCK_ADDR", maxResp=4)
+        div -= 1
+        result[2] = div
+        result[3] |= 0x01
+        self.oa.sendMessage(CODE_WRITE, "ADVCLOCK_ADDR", result, readMask=self._readMask)
+        result[3] &= ~(0x01)
+        self.oa.sendMessage(CODE_WRITE, "ADVCLOCK_ADDR", result, readMask=self._readMask)
 
 
-    def _get_husky_clkgen_div(self):
-        maindiv = self.mmcm.get_main_div()
-        secdiv = self.mmcm.get_sec_div()
-        return maindiv*secdiv
-
-
-    def _get_husky_clkgen_mul(self):
-        return self.mmcm.get_mul()
-
-
-    def reset_adc(self):
+    def reset_adc(self) -> None:
         """Reset the ADC DCM.
 
         After changing frequencies, the ADC DCM may become unlocked from its
@@ -2909,7 +2960,7 @@ class ClockSettings(util.DisableNewAttr):
 
     resetAdc = util.camel_case_deprecated(reset_adc)
 
-    def reset_clkgen(self):
+    def reset_clkgen(self) -> None:
         """Reset the CLKGEN DCM.
 
         After changing frequencies or input sources, the CLKGEN DCM may not
@@ -2922,7 +2973,7 @@ class ClockSettings(util.DisableNewAttr):
 
     resetClkgen = util.camel_case_deprecated(reset_clkgen)
 
-    def reset_dcms(self):
+    def reset_dcms(self) -> None:
         """Reset the CLKGEN DCM, then the ADC DCM.
 
         This order is necessary because the ADC may depend on having a locked
@@ -2934,11 +2985,11 @@ class ClockSettings(util.DisableNewAttr):
     resetDcms = util.camel_case_deprecated(reset_dcms)
 
     def _clkgenLoad(self):
-        result = self.oa.sendMessage(CODE_READ, ADDR_ADVCLK, maxResp=4)
+        result = self.oa.sendMessage(CODE_READ, "ADVCLOCK_ADDR", maxResp=4)
         result[3] |= 0x01
-        self.oa.sendMessage(CODE_WRITE, ADDR_ADVCLK, result, readMask=self._readMask)
+        self.oa.sendMessage(CODE_WRITE, "ADVCLOCK_ADDR", result, readMask=self._readMask)
         result[3] &= ~(0x01)
-        self.oa.sendMessage(CODE_WRITE, ADDR_ADVCLK, result, readMask=self._readMask)
+        self.oa.sendMessage(CODE_WRITE, "ADVCLOCK_ADDR", result, readMask=self._readMask)
 
 
     def _setEnabled(self, enable):
@@ -2946,10 +2997,10 @@ class ClockSettings(util.DisableNewAttr):
             val = [0]
         else:
             val = [3]
-        self.oa.sendMessage(CODE_WRITE, ADDR_CLKGEN_POWERDOWN, val, Validate=False)
+        self.oa.sendMessage(CODE_WRITE, "CLKGEN_POWERDOWN", val, Validate=False)
 
     def _getEnabled(self):
-        raw = self.oa.sendMessage(CODE_READ, ADDR_CLKGEN_POWERDOWN, Validate=False, maxResp=1)[0]
+        raw = self.oa.sendMessage(CODE_READ, "CLKGEN_POWERDOWN", Validate=False, maxResp=1)[0]
         if raw == 3:
             return False
         elif raw == 0:
@@ -2962,7 +3013,7 @@ class ClockSettings(util.DisableNewAttr):
         if self.oa is None:
             return ("dcm", 1, "extclk")
 
-        result = self.oa.sendMessage(CODE_READ, ADDR_ADVCLK, maxResp=4)
+        result = self.oa.sendMessage(CODE_READ, "ADVCLOCK_ADDR", maxResp=4)
         result[0] = result[0] & 0x07
 
         if result[0] & 0x04:
@@ -2990,7 +3041,7 @@ class ClockSettings(util.DisableNewAttr):
             dcmout = source[1]
             source=source[0]
 
-        result = self.oa.sendMessage(CODE_READ, ADDR_ADVCLK, maxResp=4)
+        result = self.oa.sendMessage(CODE_READ, "ADVCLOCK_ADDR", maxResp=4)
 
         result[0] = result[0] & ~0x07
 
@@ -3015,10 +3066,10 @@ class ClockSettings(util.DisableNewAttr):
         else:
             raise ValueError("source must be 'dcm' or 'extclk'")
 
-        self.oa.sendMessage(CODE_WRITE, ADDR_ADVCLK, result, readMask=self._readMask)
+        self.oa.sendMessage(CODE_WRITE, "ADVCLOCK_ADDR", result, readMask=self._readMask)
 
     def _set_clkgen_src(self, source="system"):
-        result = self.oa.sendMessage(CODE_READ, ADDR_ADVCLK, maxResp=4)
+        result = self.oa.sendMessage(CODE_READ, "ADVCLOCK_ADDR", maxResp=4)
 
         result[0] = result[0] & ~0x08
 
@@ -3029,10 +3080,10 @@ class ClockSettings(util.DisableNewAttr):
         else:
             raise ValueError("source must be 'system' or 'extclk'")
 
-        self.oa.sendMessage(CODE_WRITE, ADDR_ADVCLK, result, readMask=self._readMask)
+        self.oa.sendMessage(CODE_WRITE, "ADVCLOCK_ADDR", result, readMask=self._readMask)
 
     def _get_clkgen_src(self):
-        if self.oa is not None and self.oa.sendMessage(CODE_READ, ADDR_ADVCLK, maxResp=4)[0] & 0x08:
+        if self.oa is not None and self.oa.sendMessage(CODE_READ, "ADVCLOCK_ADDR", maxResp=4)[0] & 0x08:
             return "extclk"
         else:
             return "system"
@@ -3050,26 +3101,20 @@ class ClockSettings(util.DisableNewAttr):
         except ValueError as e:
             raise TypeError("Can't convert %s to int" % phase) from e
 
-        if self._is_husky:
-            if phase_int < -32767 or phase_int > 32767:
-                raise ValueError("Phase %d is outside range [-32767, 32767]" % phase_int)
-        elif phase_int < -255 or phase_int > 255:
+        if phase_int < -255 or phase_int > 255:
             raise ValueError("Phase %d is outside range [-255, 255]" % phase_int)
 
         cmd = bytearray(2)
         cmd[0] = phase_int & 0x00FF
-        if self._is_husky:
-            cmd[1] = (phase_int & 0xFF00) >> 8
-        else:
-            MSB = (phase_int & 0x0100) >> 8
-            cmd[1] = MSB | 0x02 # TODO: hmm why is this being done?
+        MSB = (phase_int & 0x0100) >> 8
+        cmd[1] = MSB | 0x02 # TODO: hmm why is this being done?
 
-        self.oa.sendMessage(CODE_WRITE, ADDR_PHASE, cmd, False)
+        self.oa.sendMessage(CODE_WRITE, "PHASE_ADDR", cmd, False)
 
     def _get_phase(self):
         if self.oa is None:
             return 0
-        result = self.oa.sendMessage(CODE_READ, ADDR_PHASE, maxResp=2)
+        result = self.oa.sendMessage(CODE_READ, "PHASE_ADDR", maxResp=2)
 
         #Current bitstream doesn't set this bit ever?
         #phase_valid = (result[1] & 0x02)
@@ -3078,18 +3123,12 @@ class ClockSettings(util.DisableNewAttr):
 
         if phase_valid:
             LSB = result[0]
-            if self._is_husky:
-                MSB = result[1]
-            else:
-                MSB = result[1] & 0x01
+            MSB = result[1] & 0x01
 
             phase = LSB | (MSB << 8)
 
             #Sign Extend
-            if self._is_husky:
-                phase = SIGNEXT(phase, 16)
-            else:
-                phase = SIGNEXT(phase, 9)
+            phase = SIGNEXT(phase, 9)
 
             return phase
         else:
@@ -3108,7 +3147,7 @@ class ClockSettings(util.DisableNewAttr):
         if self.oa is None:
             return (False, False)
 
-        result = self.oa.sendMessage(CODE_READ, ADDR_ADVCLK, maxResp=4)
+        result = self.oa.sendMessage(CODE_READ, "ADVCLOCK_ADDR", maxResp=4)
         if (result[0] & 0x80) == 0:
             scope_logger.error("ADVCLK register not present. Version mismatch")
             return (False, False)
@@ -3129,7 +3168,7 @@ class ClockSettings(util.DisableNewAttr):
         return (dcmADCLocked, dcmCLKGENLocked)
 
     def _reset_dcms(self, resetAdc=True, resetClkgen=True, resetGlitch=True):
-        result = self.oa.sendMessage(CODE_READ, ADDR_ADVCLK, maxResp=4)
+        result = self.oa.sendMessage(CODE_READ, "ADVCLOCK_ADDR", maxResp=4)
 
         #Set reset high on requested blocks only
         if resetAdc:
@@ -3140,24 +3179,23 @@ class ClockSettings(util.DisableNewAttr):
             result[3] = result[3] | 0x04
 
 
-        self.oa.sendMessage(CODE_WRITE, ADDR_ADVCLK, result, Validate=False)
+        self.oa.sendMessage(CODE_WRITE, "ADVCLOCK_ADDR", result, Validate=False)
 
         #Set reset low
         result[0] = result[0] & ~(0x10)
         result[3] = result[3] & ~(0x04)
-        self.oa.sendMessage(CODE_WRITE, ADDR_ADVCLK, result, Validate=False)
+        self.oa.sendMessage(CODE_WRITE, "ADVCLOCK_ADDR", result, Validate=False)
 
         #Load clkgen if required
         if resetClkgen:
             self._clkgenLoad()
 
         if resetGlitch:
-            glitchaddr = 51
-            reset = self.oa.sendMessage(CODE_READ, glitchaddr, Validate=False, maxResp=8)
+            reset = self.oa.sendMessage(CODE_READ, "CLOCKGLITCH_SETTINGS", Validate=False, maxResp=8)
             reset[5] |= (1<<1)
-            self.oa.sendMessage(CODE_WRITE, glitchaddr, reset, Validate=False)
+            self.oa.sendMessage(CODE_WRITE, "CLOCKGLITCH_SETTINGS", reset, Validate=False)
             reset[5] &= ~(1<<1)
-            self.oa.sendMessage(CODE_WRITE, glitchaddr, reset, Validate=False)
+            self.oa.sendMessage(CODE_WRITE, "CLOCKGLITCH_SETTINGS", reset, Validate=False)
 
     def _get_extfrequency(self):
         """Return frequency of clock measured on EXTCLOCK pin in Hz"""
@@ -3167,7 +3205,7 @@ class ClockSettings(util.DisableNewAttr):
         #Get sample frequency
         samplefreq = float(self.oa.hwInfo.sysFrequency()) / float(pow(2,23))
 
-        temp = self.oa.sendMessage(CODE_READ, ADDR_FREQ, maxResp=4)
+        temp = self.oa.sendMessage(CODE_READ, "EXTFREQ_ADDR", maxResp=4)
         freq = int.from_bytes(temp, byteorder='little')
 
         measured = freq * samplefreq
@@ -3183,7 +3221,7 @@ class ClockSettings(util.DisableNewAttr):
             #Get sample frequency
             samplefreq = float(self.oa.hwInfo.sysFrequency()) / float(pow(2,23))
 
-            temp = self.oa.sendMessage(CODE_READ, ADDR_ADCFREQ, maxResp=4)
+            temp = self.oa.sendMessage(CODE_READ, "ADCFREQ_ADDR", maxResp=4)
             freq = int.from_bytes(temp, byteorder='little')
 
             self._cached_adc_freq = int(freq * samplefreq)
@@ -3193,3 +3231,43 @@ class ClockSettings(util.DisableNewAttr):
     def _adcSampleRate(self):
         """Return the sample rate, takes account of decimation factor (if set)"""
         return self._getAdcFrequency() / self.oa.decimate()
+
+    @property
+    def adc_mul(self) -> int:
+        """ Sets a new ADC clock frequency by multiplying this value by clkgen_freq
+
+        On Husky, must be a positive integer, or 0. If 0, turns the ADC clock off.
+
+        On Lite/Pro, must be either 1 or 4
+
+        adc_freq = adc_mul * clkgen_freq
+
+        Note that the value of adc_mul affects how closely clkgen_freq can be matched
+        to the requested frequency. See clkgen_freq for more information.
+
+        :Getter: The currently set adc multiplier
+
+        :Setter: Set the adc multiplier
+
+        .. versionchanged:: 6.0
+            Added ChipWhisperer-Lite/Pro version of this property
+        """
+        x4 = ["clkgen_x4", "extclk_x4"]
+        x1 = ["clkgen_x1", "extclk_x1", "extclk_dir"]
+        if self.adc_src in x4:
+            return 4
+        elif self.adc_src in x1:
+            return 1
+        else:
+            raise ValueError("Unknown adc_src {}".format(self.adc_src))
+
+    @adc_mul.setter
+    def adc_mul(self, mul : int):
+        x4 = ["clkgen_x4", "extclk_x4"]
+        x1 = ["clkgen_x1", "extclk_x1", "extclk_dir"]
+        if self.adc_src in x4:
+            return 4
+        elif self.adc_src in x1:
+            return 1
+        else:
+            raise ValueError("Unknown adc_src {}".format(self.adc_src))

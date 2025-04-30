@@ -28,8 +28,10 @@ import re
 import os.path
 import random
 from ...common.traces import Trace
+from ...common.utils import util
 from .CW305 import CW305, CW305_USB
 from ecpy.curves import Curve, Point # type: ignore
+from collections import OrderedDict
 
 from chipwhisperer.logging import *
 
@@ -69,13 +71,35 @@ class CW305_ECC(CW305):
         self.pmul_cycles = 1124157
         # Verilog defines file(s):
         self.default_verilog_defines = 'cw305_pmul_defines.v'
-        self.default_verilog_defines_full_path = os.path.dirname(cw.__file__) +  '/../../hardware/victims/cw305_artixtarget/fpga/vivado_examples/ecc_p256_pmul/hdl/' + self.default_verilog_defines
-        self.registers = 12 # number of registers we expect to find
+        self.default_verilog_defines_full_path = os.path.dirname(cw.__file__) +  '/hardware/firmware/cw305/' + self.default_verilog_defines
+        self.registers = 20 # number of registers we expect to find
         self.bytecount_size = 8 # pBYTECNT_SIZE in Verilog
+        self.check_done = True
         self.target_name = 'Cryptech ecdsa256-v1 pmul'
 
 
-    def capture_trace(self, scope, k, operation="pmult", Px=None, Py=None, check=True):
+    def _dict_repr(self):
+        rtn = OrderedDict()
+        rtn['target_name']      = self.target_name
+        rtn['fpga_buildtime']   = self.fpga_buildtime
+        rtn['core_type']        = self.core_type
+        rtn['crypt_type']       = self.crypt_type
+        rtn['crypt_rev']        = self.crypt_rev
+        rtn['platform']         = self.platform
+        for prop in self.__dir__():
+            if 'REG_' in prop:
+                if getattr(self, prop): # this some stock registers are delcared as None and may remain so
+                    rtn[prop] = getattr(self, prop)
+        return rtn
+
+    def __repr__(self):
+        return util.dict_to_str(self._dict_repr())
+
+    def __str__(self):
+        return self.__repr__()
+
+
+    def capture_trace(self, scope, k, operation="pmult", Px=None, Py=None, check=True, as_int=False):
         """Capture a trace, running the specified test vector or operation (pmult or siggen).
 
         Does all individual steps needed to capture a trace (arming the scope,
@@ -123,7 +147,7 @@ class CW305_ECC(CW305):
                   'k': k
                   }
         textout['cycles'] = cycles
-        wave = scope.get_last_trace()
+        wave = scope.get_last_trace(as_int=as_int)
 
         if check and cycles != self.pmul_cycles:
             target_logger.warning ("Operation took %d cycles (%d more than we expect it to)" % (cycles, cycles-self.pmul_cycles))
@@ -158,7 +182,8 @@ class CW305_ECC(CW305):
         self.go()
 
         if not self.is_done():
-            target_logger.warning ("Target not done yet, increase clksleeptime!")
+            if self.platform == 'cw305' and self.clkusbautooff:
+                    target_logger.warning ("Target not done yet, increase clksleeptime!")
             #let's wait a bit more, see what happens:
             i = 0
             while not self.is_done():

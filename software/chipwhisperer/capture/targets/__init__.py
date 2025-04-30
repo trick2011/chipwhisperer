@@ -27,7 +27,10 @@ Package containing all of the target types that the ChipWhisperer API can connec
 
 Targets:
 * SimpleSerial - Communication via CW Uart Pins
-* CW305 - USB communication to CW305
+* SimpleSerial2 - Communication via CW Uart Pins (updated protocol)
+* CW305 - USB communication to CW305 (also CW305_ECC, CW305_AES_PIPELINED for extensions for those particular targets)
+* CW310 - USB communication to CW310
+* CW340 - USB communication to CW340
 * SAKURAG - Requires FTDI module, old, untested
 * SASEBOGII - Requires FTDI module, old, untested
 * SmartCard - Currently unavailable (tied to GUI)
@@ -35,20 +38,18 @@ Targets:
 from .SimpleSerial import SimpleSerial
 from .CW305 import CW305
 from .SimpleSerial2 import SimpleSerial2, SimpleSerial2_CDC
-from .CW305_AES import CW305_AES
 from .CW305_ECC import CW305_ECC
-from .CW305_Kyber import CW305_Kyber
-from .CW305_Kyber_decr import CW305_Kyber_decr
-from .CW305_Kyber_decaps import CW305_Kyber_decaps
+from .CW305_AES_PIPELINED import CW305_AES_PIPELINED
 from .CW310 import CW310
+from .CW340 import CW340
 from typing import Union
 
-try:
-    from .sakura_g import SakuraG #needs ftdi module
-except ImportError:
-    pass
+# try:
+#     from .sakura_g import SakuraG #needs ftdi module
+# except ImportError:
+#     pass
 
 # from .SmartCard import SmartCard #Tied to GUI
 SimpleSerialTypes = Union[SimpleSerial, SimpleSerial2, SimpleSerial2_CDC]
-FPGATypes = Union[CW305, CW305_AES, CW305_ECC, CW305_Kyber, CW305_Kyber_decr, CW305_Kyber_decaps, CW310]
+FPGATypes = Union[CW305, CW305_ECC, CW310, CW340]
 TargetTypes = Union[FPGATypes, SimpleSerialTypes]

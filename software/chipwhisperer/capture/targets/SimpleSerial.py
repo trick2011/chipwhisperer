@@ -27,6 +27,7 @@ from .simpleserial_readers.cwlite import SimpleSerial_ChipWhispererLite
 from ...common.utils import util
 from collections import OrderedDict
 from ...common.utils.util import camel_case_deprecated, dict_to_str
+import time
 
 from chipwhisperer.logging import *
 
@@ -45,22 +46,26 @@ class SimpleSerial(TargetTemplate, util.DisableNewAttr):
     The target is automatically connected to if the default configuration
     adequate.
 
+    A `noflush=True` kwarg may be used to suppress an initial protocol-specific
+    flush of the UART. The caller is then responsible for invoking flush() manually
+    to flush underlying buffers.
+
     For more help use the help() function with one of the submodules
     (target.baud, target.write, target.read, ...).
 
-      * :attr:`target.baud <.SimpleSerial.baud>`
-      * :meth:`target.write <.SimpleSerial.write>`
-      * :meth:`target.read <.SimpleSerial.read>`
-      * :meth:`target.in_waiting <.SimpleSerial.in_waiting>`
-      * :meth:`target.in_waiting_tx <.SimpleSerial.in_waiting_tx>`
-      * :meth:`target.simpleserial_wait_ack <.SimpleSerial.simpleserial_wait_ack>`
-      * :meth:`target.simpleserial_write <.SimpleSerial.simpleserial_write>`
-      * :meth:`target.simpleserial_read <.SimpleSerial.simpleserial_read>`
-      * :meth:`target.simpleserial_read_witherrors <.SimpleSerial.simpleserial_read_witherrors>`
-      * :meth:`target.set_key <.SimpleSerial.set_key>`
-      * :meth:`target.close <.SimpleSerial.close>`
-      * :meth:`target.con <.SimpleSerial.con>`
-      * :meth:`target.get_simpleserial_commands <.SimpleSerial.get_simpleserial_commands>`
+    * :attr:`target.baud <.SimpleSerial.baud>`
+    * :meth:`target.write <.SimpleSerial.write>`
+    * :meth:`target.read <.SimpleSerial.read>`
+    * :meth:`target.in_waiting <.SimpleSerial.in_waiting>`
+    * :meth:`target.in_waiting_tx <.SimpleSerial.in_waiting_tx>`
+    * :meth:`target.simpleserial_wait_ack <.SimpleSerial.simpleserial_wait_ack>`
+    * :meth:`target.simpleserial_write <.SimpleSerial.simpleserial_write>`
+    * :meth:`target.simpleserial_read <.SimpleSerial.simpleserial_read>`
+    * :meth:`target.simpleserial_read_witherrors <.SimpleSerial.simpleserial_read_witherrors>`
+    * :meth:`target.set_key <.SimpleSerial.set_key>`
+    * :meth:`target.close <.SimpleSerial.close>`
+    * :meth:`target.con <.SimpleSerial.con>`
+    * :meth:`target.get_simpleserial_commands <.SimpleSerial.get_simpleserial_commands>`
 
     .. warning::
         The CWLite, CW1200, and CWNano have a 128 byte read buffer and a 128
@@ -102,6 +107,10 @@ class SimpleSerial(TargetTemplate, util.DisableNewAttr):
         rtn['baud']     = self.baud
         rtn['simpleserial_last_read'] = self.simpleserial_last_read
         rtn['simpleserial_last_sent'] = self.simpleserial_last_sent
+        rtn['xonxoff'] = self.xonxoff
+        rtn['currently_xoff'] = self.currently_xoff
+        rtn['parity'] = self.parity
+        rtn['stop_bits'] = self.stop_bits
         #rtn['protver'] = self.protver
         return rtn
 
@@ -127,6 +136,35 @@ class SimpleSerial(TargetTemplate, util.DisableNewAttr):
     @output_len.setter
     def output_len(self, length):
         self._output_len = length
+
+    @property
+    def parity(self):
+        if hasattr(self.ser, 'parity') and callable(self.ser.parity):
+            return self.ser.parity()
+        else:
+            raise AttributeError("Can't access parity")
+
+    @parity.setter
+    def parity(self, parity):
+        if hasattr(self.ser, 'parity') and callable(self.ser.parity):
+            return self.ser.setParity(parity)
+        else:
+            raise AttributeError("Can't access parity")
+
+    @property
+    def stop_bits(self):
+        if hasattr(self.ser, 'stopBits') and callable(self.ser.stopBits):
+            return self.ser.stopBits()
+        else:
+            raise AttributeError("Can't access parity")
+
+    @stop_bits.setter
+    def stop_bits(self, stop_bits):
+        if hasattr(self.ser, 'stopBits') and callable(self.ser.stopBits):
+            return self.ser.setStopBits(stop_bits)
+        else:
+            raise AttributeError("Can't access parity")
+        
 
     @property
     def baud(self):
@@ -182,9 +220,15 @@ class SimpleSerial(TargetTemplate, util.DisableNewAttr):
         if not scope or not hasattr(scope, "qtadc"): Warning("You need a scope with OpenADC connected to use this Target")
 
         self.ser.con(scope)
-        # 'x' flushes everything & sets system back to idle
-        self.ser.write("xxxxxxxxxxxxxxxxxxxxxxxx")
-        self.ser.flush()
+
+        # Check to see if the caller wants to be responsible for flushing the
+        # UART on connect. For real world targets, we may just want to quietly
+        # open serial port without sending "xxx..." at a potentially incorrect
+        # baud rate.
+        if kwargs.get('noflush', False) == False:
+            # 'x' flushes everything & sets system back to idle
+            self.ser.write("xxxxxxxxxxxxxxxxxxxxxxxx")
+            self.ser.flush()
 
     def dis(self):
         self.close()
@@ -228,11 +272,13 @@ class SimpleSerial(TargetTemplate, util.DisableNewAttr):
 
 
 
-    def write(self, data):
+    def write(self, data, timeout=0):
         """ Writes data to the target over serial.
 
         Args:
             data (str): Data to write over serial.
+            timeout (float or None): Wait <timeout> seconds for write buffer to clear.
+                If None, block for a long time. If 0, return immediately. Defaults to 0.
 
         Raises:
             Warning: Target not connected
@@ -240,11 +286,14 @@ class SimpleSerial(TargetTemplate, util.DisableNewAttr):
         .. versionadded:: 5.1
             Added target.write()
         """
+        if type(data) is list:
+            data = bytearray(data)
         if not self.connectStatus:
             raise Warning("Target not connected")
 
         try:
-            self.ser.write(data)
+            self.ser.write(data, timeout)
+                    
         except Exception as e:
             self.dis()
             raise e
@@ -312,7 +361,7 @@ class SimpleSerial(TargetTemplate, util.DisableNewAttr):
             return None
         return ret
 
-    def simpleserial_write(self, cmd, num, end='\n'):
+    def simpleserial_write(self, cmd, num, end='\n', var_len=False):
         """ Writes a simpleserial command to the target over serial.
 
         Writes 'cmd' + ascii(num) + 'end' over serial. Flushes the read and
@@ -326,6 +375,8 @@ class SimpleSerial(TargetTemplate, util.DisableNewAttr):
                 before being sent. If set to 'none' is omitted.
             end (str, optional): String to end the simpleserial command with.
                 Defaults to '\\n'.
+            var_len (bool, optional): Indicates that this command is variable length.
+                Must be supported by firmware. Defaults to False.
 
         Example:
             Sending a 'p' command::
@@ -339,7 +390,14 @@ class SimpleSerial(TargetTemplate, util.DisableNewAttr):
         .. versionadded:: 5.1
             Added target.simpleserial_write()
         """
+        if type(num) is list:
+            num = bytearray(num)
+
+        if len(num) > 64:
+            raise ValueError("Message length too long! Max len=64bytes")
         self.ser.flush()
+        if var_len is True:
+            cmd += "{:02X}".format(len(num))
         if cmd:
             cmd += binascii.hexlify(num).decode()
         cmd += end
@@ -453,12 +511,14 @@ class SimpleSerial(TargetTemplate, util.DisableNewAttr):
                 rv: If 'ack' in command, includes return value
 
         Example:
-            Reading the output of one of the glitch tests when no error:
+            Reading the output of one of the glitch tests when no error::
+
                 resp = target.simpleserial_read_witherrors('r', 4)
                 print(resp)
                 >{'valid': True, 'payload': CWbytearray(b'c4 09 00 00'), 'full_response': 'rC4090000\n', 'rv': 0}
 
-            Reading the output of one of the glitch tests when an error happened:
+            Reading the output of one of the glitch tests when an error happened::
+
                 resp = target.simpleserial_read_witherrors('r', 4)
                 print(resp)
                 >{'valid': False, 'payload': None, 'full_response': '\x00\x00\x00\x00\x00\x00\x00rRESET   \n', 'rv': None}
@@ -510,7 +570,7 @@ class SimpleSerial(TargetTemplate, util.DisableNewAttr):
         self._simpleserial_last_read = response
         return {'valid': valid, 'payload': payload, 'full_response': response, 'rv': rv}
 
-    def set_key(self, key, ack=True, timeout=250):
+    def set_key(self, key, ack=True, timeout=250, always_send=False):
         """Checks if key is different than the last one sent. If so, send it.
 
         Uses simpleserial_write('k')
@@ -528,7 +588,7 @@ class SimpleSerial(TargetTemplate, util.DisableNewAttr):
         .. versionadded:: 5.1
             Added target.set_key()
         """
-        if self.last_key != key:
+        if (self.last_key != key) or always_send:
             self.last_key = key
             self.simpleserial_write('k', key)
             if ack:
@@ -573,3 +633,16 @@ class SimpleSerial(TargetTemplate, util.DisableNewAttr):
             Added public method for in_waiting_tx().
         """
         return self.ser.inWaitingTX()
+
+    @property
+    def xonxoff(self):
+        # NOTE: Firmware version checked in lower serial driver
+        return self.ser.xonxoff
+    
+    @xonxoff.setter
+    def xonxoff(self, enable):
+        self.ser.xonxoff = enable
+
+    @property
+    def currently_xoff(self):
+        return self.ser.currently_xoff

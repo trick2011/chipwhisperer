@@ -27,10 +27,11 @@ import struct
 import time
 import traceback
 from datetime import datetime
-from chipwhisperer.hardware.naeusb.programmer_targetfpga import LatticeICE40
+from .programmer_targetfpga import LatticeICE40
 from functools import reduce, wraps
 from chipwhisperer.logging import *
 import numpy as np
+from ...capture.utils.IntelHex import IntelHex
 
 import warnings
 def gen_app_binary(rom):
@@ -118,11 +119,13 @@ class Neorv32Programmer:
                 devtype = devtype[0].lower()
             
             if devtype == "ice40up5k":
-                from chipwhisperer.hardware.firmware.cwtargetice40 import getsome
+                # from chipwhisperer.hardware.firmware.cwtargetice40 import getsome
+                from ..firmware.open_fw import res_file_path
             else:
                 raise ValueError("Device type: %s. I don't have a pre-built FPGA bitstream for you (or connection bad)."%devtype)
             
-            bsdata = getsome("neorv32_iCE40CW312_MinimalBoot_directclk_7370KHz.bit").read()
+            # bsdata = getsome("neorv32_iCE40CW312_MinimalBoot_directclk_7370KHz.bit").read()
+            bsdata = open(res_file_path("cwtargetice40", "neorv32_iCE40CW312_MinimalBoot_directclk_7370KHz.bit"), "rb").read()
         else:
             target_logger.info("ice40: Loading bitstream from %s"%bsfile)
             f = open(bsfile, "rb")
@@ -197,9 +200,13 @@ class Neorv32Programmer:
         """Programs memory type, dealing with opening filename as either .hex or .bin file"""
         self.lastFlashedFile = romfilename
 
-        f = open(romfilename, "rb")
-        romdata = f.read()
-        f.close()
+        if romfilename.endswith(".hex"):
+            f = IntelHex(romfilename)
+            romdata = f.tobinarray(start=f.minaddr())
+        else:
+            f = open(romfilename, "rb")
+            romdata = f.read()
+            f.close()
 
         if check_rom_size:
             if len(romdata) > 64000:

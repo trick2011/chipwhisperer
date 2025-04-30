@@ -1,20 +1,19 @@
-# Minimal makefile for Sphinx documentation
-#
+all: spell img_src_check admonition_check blockquote_header_check
+spell:
+	@echo "Running aspell on markdown files..."
+	@find . -type f -name "*.md"   -not -path "./source/_build/*" -not -path "*/.github/*" -not -path "*kicad*/*" -exec aspell check --mode=markdown --lang=en --personal=./aspell.list  {} \;
+	@echo "Running aspell on rst files..."
+	@find . -type f -name "*.rst" -not -path "./source/_build/*" -exec aspell check --lang=en --personal=./aspell.list  {} \;
 
-# You can set these variables from the command line, and also
-# from the environment for the first two.
-SPHINXOPTS    ?=
-SPHINXBUILD   ?= sphinx-build
-SOURCEDIR     = .
-BUILDDIR      = _build
+img_src_check:
+	@echo "Checking for <img src=...> tags..."
+	@rg -tmd "img src="  -g'!_build' || true
 
-# Put it first so that "make" without argument is like "make help".
-help:
-	@$(SPHINXBUILD) -M help "$(SOURCEDIR)" "$(BUILDDIR)" $(SPHINXOPTS) $(O)
+admonition_check:
+	@echo "Checking for !!! admonitions..."
+	@rg -tmd '!!!' -g'!_build' -g'!colophon.md' || true
 
-.PHONY: help Makefile
+blockquote_header_check:
+	@echo "Checking for ># blockquote headers..."
+	@rg -tmd ">#" -g'!_build' -g'!colophon.md' || true
 
-# Catch-all target: route all unknown targets to Sphinx using the new
-# "make mode" option.  $(O) is meant as a shortcut for $(SPHINXOPTS).
-%: Makefile
-	@$(SPHINXBUILD) -M $@ "$(SOURCEDIR)" "$(BUILDDIR)" $(SPHINXOPTS) $(O)

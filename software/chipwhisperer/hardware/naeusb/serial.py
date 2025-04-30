@@ -25,10 +25,12 @@
 
 import time
 import os
-from .naeusb import packuint32
-from ...common.utils.util import fw_ver_required
 from ...logging import *
-from .naeusb import NAEUSB
+from ...common.utils import util
+from .naeusb import NAEUSB, NAEUSB_CTRL_IO_MAX
+
+SERIAL_MAX_WRITE = 58
+
 class USART(object):
     """
     USART Class communicates with NewAE USB Interface to read/write data over control endpoint.
@@ -42,12 +44,13 @@ class USART(object):
     USART_CMD_DISABLE = 0x0012
     USART_CMD_NUMWAIT = 0x0014
     USART_CMD_NUMWAIT_TX = 0x0018
+    USART_CMD_XONXOFF = 0x0020
 
     def __init__(self, usb, timeout=200, usart_num=0):
         """
         Set the USB communications instance.
         """
-        self._max_read = 256
+        self._max_read = NAEUSB_CTRL_IO_MAX
 
         self._usb : NAEUSB = usb
         self.timeout = timeout
@@ -72,32 +75,46 @@ class USART(object):
         self._stopbits = stopbits
         self._parity = parity
 
-        if stopbits == 1:
-            stopbits = 0
-        elif stopbits == 1.5:
-            stopbits = 1
-        elif stopbits == 2:
-            stopbits = 2
-        else:
-            raise ValueError("Invalid stop-bit spec: %s" % str(stopbits))
+        valid_stopbits = [1, 1.5, 2]
+        valid_parity = ["none", "odd", "even", "mark", "space"]
+        try:
+            stopbits = valid_stopbits.index(stopbits)
+        except ValueError:
+            raise ValueError("Invalid stop-bit {}, must be one of {}".format(stopbits, valid_stopbits))
 
-        if parity == "none":
-            parity = 0
-        elif parity == "odd":
-            parity = 1
-        elif parity == "even":
-            parity = 2
-        elif parity == "mark":
-            parity = 3
-        elif parity == "space":
-            parity = 4
-        else:
-            raise ValueError("Invalid parity spec: %s" % str(parity))
+        try:
+            parity = valid_parity.index(parity)
+        except ValueError:
+            raise ValueError("Invalid parity {}, must be one of {}".format(parity, valid_parity))
+            
 
-        cmdbuf = packuint32(baud)
-        cmdbuf.append(stopbits)
-        cmdbuf.append(parity)
-        cmdbuf.append(8)  # Data bits
+        # if stopbits == 1:
+        #     stopbits = 0
+        # elif stopbits == 1.5:
+        #     stopbits = 1
+        # elif stopbits == 2:
+        #     stopbits = 2
+        # else:
+        #     raise ValueError("Invalid stop-bit spec: %s" % str(stopbits))
+
+        # if parity == "none":
+        #     parity = 0
+        # elif parity == "odd":
+        #     parity = 1
+        # elif parity == "even":
+        #     parity = 2
+        # elif parity == "mark":
+        #     parity = 3
+        # elif parity == "space":
+        #     parity = 4
+        # else:
+        #     raise ValueError("Invalid parity spec: %s" % str(parity))
+
+        cmdbuf = bytearray(7)
+        util.pack_u32_into(cmdbuf, 0, int(baud))
+        cmdbuf[4] = stopbits
+        cmdbuf[5] = parity
+        cmdbuf[6] = 8 # Data bits
 
         self._usartTxCmd(self.USART_CMD_INIT, cmdbuf)
         self._usartTxCmd(self.USART_CMD_ENABLE)
@@ -118,29 +135,31 @@ class USART(object):
         """
         # print "%d: %s" % (len(data), str(data))
 
-        try:
-            data = bytearray(data)
-        except TypeError:
-            try:
-                data = bytearray(data, 'latin-1')
-            except TypeError:
-                #Second type-error happens if input was already list?
-                pass
+        data = util.get_bytes_memview(data)
 
-        datasent = 0
-
-        while datasent < len(data):
-            datatosend = len(data) - datasent
-            datatosend = min(datatosend, 58)
-
+        pos = 0
+        end = 0
+        dlen = len(data)
+        while dlen > 0:
             # need to make sure we don't write too fast
             # and overrun the internal buffer...
             # Can probably elimiate some USB communication
             # to make this faster, but okay for now...
+            wlen = SERIAL_MAX_WRITE
             if self.tx_buf_in_wait:
-                datatosend = min(datatosend, 128-self.in_waiting_tx())
-            self._usb.sendCtrl(self.CMD_USART0_DATA, (self._usart_num << 8), data[datasent:(datasent + datatosend)])
-            datasent += datatosend
+                wlen -= self.in_waiting_tx()
+                if wlen < 1:
+                    continue
+            if dlen < wlen:
+                wlen = dlen
+            end += wlen
+            dlen -= wlen
+            self._usb.sendCtrl(self.CMD_USART0_DATA, (self._usart_num << 8), data[pos:end])
+            pos = end
+
+        # print("sent: " + str(data))
+
+        return pos
 
         # if self.fw_version_str >= '0.20':
         #     i = 1000
@@ -162,6 +181,11 @@ class USART(object):
         while(inwait):
             self.read(inwait)
             inwait = self.inWaiting()
+        outwait = self.in_waiting_tx()
+
+        while (outwait):
+            time.sleep(0.01)
+            outwait = self.in_waiting_tx()
 
     def inWaiting(self):
         """
@@ -186,29 +210,45 @@ class USART(object):
         Read data from input buffer, if 'dlen' is 0 everything present is read. If timeout is non-zero
         system will block for a while until data is present in buffer.
         """
-        resp = []
-
         if timeout == 0:
             timeout = self.timeout
 
         waiting = self.inWaiting()
 
-        if dlen == 0:
+        if dlen < 1:
             dlen = waiting
 
-        # * 10 does nothing
-        while dlen and (timeout) > 0:
+        resp = bytearray(dlen)
+        pos = 0
+        end = 0
+        while dlen > 0:
             if waiting > 0:
-                newdata = self._usb.readCtrl(self.CMD_USART0_DATA, (self._usart_num << 8), min(min(waiting, dlen), self._max_read))
-                resp.extend(newdata)
-                dlen -= len(newdata)
-            waiting = self.inWaiting()
+                rlen = self._max_read
+                if waiting < rlen:
+                    rlen = waiting
+                if dlen < rlen:
+                    rlen = dlen
+                newdata = self._usb.readCtrl(self.CMD_USART0_DATA, (self._usart_num << 8), rlen)
+                rlen = len(newdata)
+                end += rlen
+                dlen -= rlen
+                resp[pos:end] = newdata
+                pos = end
+
+            if timeout <= 0:
+                break
             timeout -= 1
             # time.sleep(0.001)
             if (timeout % 10) == 0:
                 time.sleep(0.01)
 
-        return resp
+            waiting = self.inWaiting()
+
+        # print("read: " + str(resp))
+        if dlen == 0:
+            return resp
+        else:
+            return resp[:pos]
 
 
     def _usartTxCmd(self, cmd, data=[]):
@@ -226,6 +266,9 @@ class USART(object):
         # windex selects interface, set to 0
         return self._usb.readCtrl(self.CMD_USART0_CONFIG, cmd | (self._usart_num << 8), dlen)
 
+    def close(self):
+        pass # does nothing, for normal serial compatability
+
     @property
     def fw_version(self):
         if not self.fw_read:
@@ -237,3 +280,22 @@ class USART(object):
         if not self.fw_read:
             self.fw_read = self._usb.readFwVersion()
         return "{}.{}.{}".format(self.fw_read[0], self.fw_read[1], self.fw_read[2])
+
+    @property
+    def xonxoff(self):
+        # TODO: check version to make sure fw has this
+        if self._usb.check_feature("XON_XOFF"):
+            return self._usartRxCmd(self.USART_CMD_XONXOFF)[0] & 0x01
+        return None
+    
+    @xonxoff.setter
+    def xonxoff(self, enable):
+        if self._usb.check_feature("XON_XOFF"):
+            enable = 1 if enable else 0
+            self._usartTxCmd(self.USART_CMD_XONXOFF, [enable])
+
+    @property
+    def currently_xoff(self):
+        if self._usb.check_feature("XON_XOFF"):
+            return self._usartRxCmd(self.USART_CMD_XONXOFF)[0] & 0x02
+        return None

@@ -30,15 +30,27 @@ import os.path
 import re
 import io
 from ._base import TargetTemplate
+from .SimpleSerial2 import SimpleSerial2
 from ...hardware.naeusb.naeusb import NAEUSB,packuint32
 from ...hardware.naeusb.pll_cdce906 import PLLCDCE906
 from ...hardware.naeusb.fpga import FPGA
+from ...hardware.naeusb.programmer_targetfpga import CW312T_XC7A35T, LatticeICE40
 from ...common.utils import util
-from ...common.utils.util import camel_case_deprecated, fw_ver_required
+from ...common.utils.util import camel_case_deprecated
 from ..scopes.cwhardware.ChipWhispererSAM3Update import SAMFWLoader
 from ..api.cwcommon import ChipWhispererCommonInterface
+from collections import OrderedDict
 
 from ...logging import *
+
+def check_cw305(fn):
+    def inner(self=None, *args, **kwargs):
+        if self.platform not in ['cw305', 'cw310', 'cw340']:
+            target_logger.warning("%s is a CW305 method for hardware which does not exist on this target." % fn.__name__)
+        else:
+            return fn(self, *args, **kwargs)
+    return inner
+
 
 class CW305_USB(object):
     REQ_SYSCFG = 0x22
@@ -61,7 +73,7 @@ class CW305(TargetTemplate, ChipWhispererCommonInterface):
 
         # scope can also be None here, unlike with the default SimpleSerial
         target = cw.target(scope,
-                targets.CW305, bsfile=<valid FPGA bitstream file>)
+                cw.targets.CW305, bsfile=<valid FPGA bitstream file>)
 
     As of CW5.3, you can also specify the following::
 
@@ -98,7 +110,7 @@ class CW305(TargetTemplate, ChipWhispererCommonInterface):
 
     For more help about CW305 settings, try help() on this CW305 submodule:
 
-       * target.pll
+    * target.pll
     """
 
 
@@ -109,8 +121,8 @@ class CW305(TargetTemplate, ChipWhispererCommonInterface):
 
 
     def _getFWPy(self):
-        from ...hardware.firmware.cw305 import fwver
-        return fwver
+        from ...hardware.firmware.open_fw import fwver
+        return fwver("cw305")
 
     def __init__(self):
         import chipwhisperer as cw
@@ -123,27 +135,53 @@ class CW305(TargetTemplate, ChipWhispererCommonInterface):
         self.REG_USER_LED = None
         self.REG_CRYPT_CIPHEROUT = None
         self.REG_BUILDTIME = None
+        self.REG_CRYPT_TYPE = None
+        self.REG_CRYPT_REV = None
 
-        self._naeusb = NAEUSB()
-        self.pll = PLLCDCE906(self._naeusb, ref_freq = 12.0E6)
-        self.fpga = FPGA(self._naeusb)
+        self._naeusb = None
+        self.pll = None
+        self.fpga = None
+        self.ss2 = None
+        self.platform = None
 
         self.hw = None
         self.oa = None
 
         self._woffset_sam3U = 0x000
-        self.default_verilog_defines = 'cw305_defines.v'
-        self.default_verilog_defines_full_path = os.path.dirname(cw.__file__) +  '/../../hardware/victims/cw305_artixtarget/fpga/common/' + self.default_verilog_defines
+        self.default_verilog_defines = 'cw305_aes_defines.v'
+        self.default_verilog_defines_full_path = os.path.dirname(cw.__file__) +  '/hardware/firmware/cw305/' + self.default_verilog_defines
         self.registers = 12 # number of registers we expect to find
         self.bytecount_size = 7 # pBYTECNT_SIZE in Verilog
 
         self._clksleeptime = 1
         self._clkusbautooff = True
+        self.toggle_user_led = False
+        self.check_done = False
         self.last_key = bytearray([0]*16)
         self.target_name = 'AES'
 
     def _getNAEUSB(self):
         return self._naeusb
+
+    def _dict_repr(self):
+        rtn = OrderedDict()
+        rtn['target_name']      = self.target_name
+        rtn['fpga_buildtime']   = self.fpga_buildtime
+        rtn['core_type']        = self.core_type
+        rtn['crypt_type']       = self.crypt_type
+        rtn['crypt_rev']        = self.crypt_rev
+        rtn['platform']         = self.platform
+        for prop in self.__dir__():
+            if 'REG_' in prop:
+                if getattr(self, prop): # this some stock registers are delcared as None and may remain so
+                    rtn[prop] = getattr(self, prop)
+        return rtn
+
+    def __repr__(self):
+        return util.dict_to_str(self._dict_repr())
+
+    def __str__(self):
+        return self.__repr__()
 
     def slurp_defines(self, defines_files=None):
         """ Parse Verilog defines file so we can access register and bit
@@ -213,9 +251,43 @@ class CW305(TargetTemplate, ChipWhispererCommonInterface):
         return "{}/{}/{}, {:02d}:{:02d}".format(month, day, year, hour, minute)
         return "FPGA build time: {}/{}/{}, {}:{}".format(month, day, year, hour, minute)
 
+    @property
+    def fpga_buildtime(self):
+        return self.get_fpga_buildtime()
+
+    @property
+    def crypt_type(self):
+        """ Returns the value of the target's REG_CRYPT_TYPE register (if it exists).
+        """
+        if self.REG_CRYPT_TYPE is None:
+            target_logger.error("target.REG_CRYPT_TYPE unset. Have you given target a verilog defines file?")
+        return self.fpga_read(self.REG_CRYPT_TYPE, 1)[0]
+
+    @property
+    def crypt_rev(self):
+        """ Returns the value of the target's REG_CRYPT_REV register (if it exists).
+        """
+        if self.REG_CRYPT_REV is None:
+            target_logger.error("target.REG_CRYPT_REV unset. Have you given target a verilog defines file?")
+        return self.fpga_read(self.REG_CRYPT_REV, 1)[0]
+
+    @property
+    def core_type(self):
+        """ Infers the target core type from the target's REG_CRYPT_TYPE register (if it exists).
+        """
+        ctype = self.crypt_type
+        if ctype == 2:
+            return 'AES'
+        elif ctype == 3:
+            return 'ECC'
+        elif ctype == 4:
+            return 'AES pipeline'
+        else:
+            return 'unknown'
+
 
     def fpga_write(self, addr, data):
-        """Write to an address on the FPGA
+        """Write to an address on the FPGA.
 
         Args:
             addr (int): Address to write to
@@ -225,10 +297,17 @@ class CW305(TargetTemplate, ChipWhispererCommonInterface):
         if len(data) <= 0:
             raise ValueError("Invalid data {}".format(data))
         addr = addr << self.bytecount_size
-        return self._naeusb.cmdWriteMem(addr, data)
+        if self.platform in ['cw305', 'cw310', 'cw340']:
+            return self._naeusb.cmdWriteMem(addr, data)
+        elif 'ss2' in self.platform:
+            payload = list(int.to_bytes(addr, length=4, byteorder='little'))
+            payload.extend(data)
+            self.ss2.send_cmd(cmd=0x23, scmd=0x57, data=payload)
+            self._ss2_check_status()
+
 
     def fpga_read(self, addr, readlen):
-        """Read from an address on the FPGA
+        """Read from an address on the FPGA.
 
         Args:
             addr (int): Address to read from
@@ -240,9 +319,58 @@ class CW305(TargetTemplate, ChipWhispererCommonInterface):
         if readlen <= 0:
             raise ValueError("Invalid read len {}".format(readlen))
         addr = addr << self.bytecount_size
-        data = self._naeusb.cmdReadMem(addr, readlen)
-        return data
+        if self.platform in ['cw305', 'cw310', 'cw340']:
+            data = self._naeusb.cmdReadMem(addr, readlen)
+            return data
 
+        elif 'ss2' in self.platform:
+            if readlen not in range(1, 250):
+                raise ValueError("readlen cannot be greater than 249")
+            payload = list(int.to_bytes(addr, length=4, byteorder='little'))
+            payload.append(readlen)
+            self.ss2.send_cmd(cmd=0x23, scmd=0x52, data=payload)
+            # read response:
+            rresp = list(self.ss2.read_cmd(cmd=0x23, pay_len=readlen))
+            self._ss2_check_status()
+            return rresp[3:3+readlen]
+
+    def _ss2_test_echo(self, data=None):
+        """ Sends an "echo" packet which the SS2 wrapper hardware will resend back to us; useful
+        for validating that UART communication is functional
+
+        Args:
+            data (list): list of 4 8-bit integers to include in the echo packet.
+                Randomized if left undefined.
+
+        """
+        if not self.ss2:
+            target_logger.error("This method can only be used with an ss2 target.")
+        if not data:
+            data = []
+            for i in range(4):
+                data.append(random.randint(0,255))
+        elif len(data) != 4:
+            raise ValueError("data must be a list of 4 integers")
+        self.ss2.send_cmd(cmd=0x23, scmd=0x45, data=data)
+        rresp = list(self.ss2.read_cmd(cmd=0x23, pay_len=4))
+        assert rresp[3:7] == data
+        self._ss2_check_status()
+
+
+    def _ss2_check_status(self):
+        """ In the SSv2 protocol, the target must reply to each command with an "error" packet
+        to report its status. This method verifies that the status is OK, logs an error if not.
+        """
+        if not self.ss2:
+            target_logger.error("This method can only be used with an ss2 target.")
+        sresp = list(self.ss2.read_cmd(cmd=0x65, pay_len=1))
+        if sresp[:4] != [0,101,1,0]:
+            target_logger.error("ERROR on status response. Raw packet = %s. Error code (%d): %s.\
+                                 Note that any DUT register write may still have gotten carried out using data other than intended! \
+                                 Best start from scratch here." % (sresp, sresp[3], self.ss2.strerror(sresp[3])))
+
+
+    @check_cw305
     def usb_clk_setenabled(self, status):
         """ Turn on or off the Data Clock to the FPGA """
         if status:
@@ -250,10 +378,12 @@ class CW305(TargetTemplate, ChipWhispererCommonInterface):
         else:
             self._naeusb.sendCtrl(CW305_USB.REQ_SYSCFG, CW305_USB.SYSCFG_CLKOFF)
 
+    @check_cw305
     def usb_trigger_toggle(self, _=None):
         """ Toggle the trigger line high then low """
         self._naeusb.sendCtrl(CW305_USB.REQ_SYSCFG, CW305_USB.SYSCFG_TOGGLE)
 
+    @check_cw305
     def vccint_set(self, vccint=1.0):
         """ Set the VCC-INT for the FPGA """
 
@@ -275,13 +405,45 @@ class CW305(TargetTemplate, ChipWhispererCommonInterface):
         if resp[0] != 2:
             raise IOError("VCC-INT Write Error, response = %d" % resp[0])
 
+    def is_programmed(self):
+        """Is FPGA programmed.
+
+        Returns:
+            True if the FPGA is programmed, otherwise False.
+            
+        .. warning:: This function may erroneously return True if the FPGA is not powered.
+        """
+        try:
+            return (self.fpga.isFPGAProgrammed() == True)
+        except:
+            return False
+
+    def INITB_state(self):
+        """Returns the state of the FPGA's INITB pin.
+
+        The INITB is high when the FPGA is programmed, and low when it is not.
+
+        Returns:
+            True if the INITB is high, False if INITB is low, None if the result is invalid.
+        """
+        try:
+            return self.fpga.INITBState() 
+        except:
+            return None
+
+    @check_cw305
     def vccint_get(self):
         """ Get the last set value for VCC-INT """
 
         resp = self._naeusb.readCtrl(CW305_USB.REQ_VCCINT, dlen=3)
         return float(resp[1] | (resp[2] << 8)) / 1000.0
 
-    def _con(self, scope=None, bsfile=None, force=False, fpga_id=None, defines_files=None, slurp=True, prog_speed=10E6, hw_location=None, sn=None):
+    def _get_fpga_programmer(self):
+        if self.platform != 'cw305':
+            raise NotImplementedError("Not supported for non CW305 boards")
+        return self.fpga
+
+    def _con(self, scope=None, bsfile=None, force=False, fpga_id=None, defines_files=None, slurp=True, prog_speed=20E6, hw_location=None, sn=None, platform='cw305', version=None, program=True):
         """Connect to CW305 board, and download bitstream.
 
         If the target has already been programmed it skips reprogramming
@@ -293,74 +455,157 @@ class CW305(TargetTemplate, ChipWhispererCommonInterface):
             force (bool): Whether or not to force reprogramming.
             fpga_id (string): '100t', '35t', or None. If bsfile is None and fpga_id specified,
                               program with AES firmware for fpga_id
-            defines_files (list, optional): path to cw305_defines.v
+            defines_files (list, optional): list of Verilog define files to parse
             slurp (bool, optional): Whether or not to slurp the Verilog defines.
+            platform (string, optional): 'cw305', or 'ss2' for non-CW305 target FPGA platforms.
+                The latter is intended for target designs using the ss2.v
+                simpleserial-to-parallel wrapper.
+            version (optional): when required to differentiate from multiple possible bitfiles
+                for a particular target (to be used with fpga_id)
+            program (bool, optional): for ss2 platforms, program the FPGA
         """
-        self._naeusb.con(idProduct=[0xC305], serial_number=sn, hw_location=hw_location)
-        if not fpga_id is None:
-            if fpga_id not in ('100t', '35t'):
-                raise ValueError(f"Invalid fpga {fpga_id}")
-        self._fpga_id = fpga_id
-        if self.fpga.isFPGAProgrammed() == False or force:
-            if bsfile is None:
-                if not fpga_id is None:
-                    from chipwhisperer.hardware.firmware.cw305 import getsome
-                    if self.target_name == 'AES':
-                        bsdata = getsome(f"AES_{fpga_id}.bit")
-                    elif self.target_name == 'Cryptech ecdsa256-v1 pmul':
-                        bsdata = getsome(f"ECDSA256v1_pmul_{fpga_id}.bit")
+        self.platform = platform
+        if bsfile is None:
+            custom_bitstream = False
+        else:
+            custom_bitstream = True
+        if platform == 'cw305':
+            self._naeusb = NAEUSB()
+            self.pll = PLLCDCE906(self._naeusb, ref_freq = 12.0E6, board="CW305")
+            self.fpga = FPGA(self._naeusb)
+            self._naeusb.con(idProduct=[0xC305], serial_number=sn, hw_location=hw_location)
+            if not fpga_id is None:
+                if fpga_id not in ('100t', '35t'):
+                    raise ValueError(f"Invalid fpga {fpga_id}")
+            self._fpga_id = fpga_id
+            if self.fpga.isFPGAProgrammed() == False or force:
+                if bsfile is None:
+                    if not fpga_id is None:
+                        from ...hardware.firmware.open_fw import getsome_generator
+                        getsome = getsome_generator("cw305")
+                        if self.target_name == 'AES':
+                            bsdata = getsome(f"AES_{fpga_id}.bit")
+                        elif self.target_name == 'Cryptech ecdsa256-v1 pmul':
+                            if version is None or version == 0:
+                                version = ''
+                            else:
+                                version = '_attempt' + str(version)
+                            bsdata = getsome(f"ECDSA256v1_pmul{version}_{fpga_id}.bit")
+                        elif self.target_name == 'Pipelined AES':
+                            if version is None:
+                                version = 0
+                            bsdata = getsome(f"Pipelined_AES_{fpga_id}_half{version}.bit")
+                        else:
+                            raise ValueError('Unknown target!')
+                        starttime = datetime.now()
+                        status = self.fpga.FPGAProgram(bsdata, exceptOnDoneFailure=False, prog_speed=prog_speed)
+                        stoptime = datetime.now()
+                        if status:
+                            target_logger.info('FPGA Config OK, time: %s' % str(stoptime - starttime))
+                        else:
+                            target_logger.error('FPGA Done pin failed to go high, check bitstream is for target device.')
+                    else:
+                        target_logger.warning("No FPGA Bitstream file specified.")
+                elif not os.path.isfile(bsfile):
+                    target_logger.warning(("FPGA Bitstream not configured or '%s' not a file." % str(bsfile)))
+                else:
                     starttime = datetime.now()
-                    status = self.fpga.FPGAProgram(bsdata, exceptOnDoneFailure=False, prog_speed=prog_speed)
+                    status = self.fpga.FPGAProgram(open(bsfile, "rb"), exceptOnDoneFailure=False, prog_speed=prog_speed)
                     stoptime = datetime.now()
                     if status:
                         target_logger.info('FPGA Config OK, time: %s' % str(stoptime - starttime))
                     else:
-                        target_logger.error('FPGA Done pin failed to go high, check bitstream is for target device.')
-                else:
-                    target_logger.warning("No FPGA Bitstream file specified.")
-            elif not os.path.isfile(bsfile):
-                target_logger.warning(("FPGA Bitstream not configured or '%s' not a file." % str(bsfile)))
-            else:
-                starttime = datetime.now()
-                status = self.fpga.FPGAProgram(open(bsfile, "rb"), exceptOnDoneFailure=False, prog_speed=prog_speed)
-                stoptime = datetime.now()
-                if status:
-                    target_logger.info('FPGA Config OK, time: %s' % str(stoptime - starttime))
-                else:
-                    target_logger.warning('FPGA Done pin failed to go high, check bitstream is for target device.')
+                        target_logger.warning('FPGA Done pin failed to go high, check bitstream is for target device.')
 
-        self.usb_clk_setenabled(True)
-        self.pll.cdce906init()
+            self.usb_clk_setenabled(True)
+            self.pll.cdce906init()
+            self.toggle_user_led = True
+            self.check_done = True
+
+        elif 'ss2' in self.platform:
+            if force or sn or hw_location:
+                target_logger.warning("force, sn and hw_location parameters have no effect on this platform")
+            if not scope:
+                raise ValueError("scope must be specified")
+
+            if program:
+                if self.platform == 'ss2_ice40':
+                    self.fpga = LatticeICE40(scope)
+                    self._fpga_id = 'cw312t_ice40'
+                else:
+                    self.fpga = CW312T_XC7A35T(scope)
+                    self._fpga_id = 'cw312t_a35'
+
+                if bsfile is None:
+                    if self.platform == 'ss2_ice40':
+                        from ...hardware.firmware.open_fw import getsome_generator
+                        getsome = getsome_generator("cwtargetice40")
+                        if self.target_name == 'AES':
+                            bsfile = getsome(f"iCE40UP5K_SS2.bin")
+                        else:
+                            raise ValueError('Unknown target!')
+                    else:
+                        from ...hardware.firmware.open_fw import getsome_generator
+                        getsome = getsome_generator("xc7a35")
+                        if self.target_name == 'AES':
+                            bsfile = getsome(f"AES_cw312t_a35.bit")
+                        elif self.target_name == 'Cryptech ecdsa256-v1 pmul':
+                            if version is None or version == 0:
+                                version = ''
+                            else:
+                                version = '_attempt' + str(version)
+                            bsfile = getsome(f"ECDSA256v1_pmul{version}_{fpga_id}.bit")
+                        elif self.target_name == 'Pipelined AES':
+                            if version is None:
+                                version = 0
+                            bsfile = getsome(f"Pipelined_AES_cw312t_a35_half{version}.bit")
+                        else:
+                            raise ValueError('Unknown target!')
+
+                if self.platform == 'ss2_ice40':
+                    self.fpga.erase_and_init()
+                    self.fpga.program(bsfile, sck_speed=prog_speed, start=True, use_fast_usb=False)
+                else:
+                    self.fpga.program(bsfile, sck_speed=prog_speed)
+
+            ss2 = SimpleSerial2()
+            ss2.con(scope)
+            if scope._getNAEUSB().check_feature("SERIAL_200_BUFFER"):
+                ss2.ser.cwlite_usart._max_read = 128
+            self.ss2 = ss2
+            self.pll = SS2_CW305_NoPll()
+            self._naeusb = None
+            self.bytecount_size = 8
+
+        else:
+            raise ValueError("Invalid platform %s. Use 'cw305' or 'ss2'." % platform)
+
 
         if slurp:
-            # If fpga_id is provided, Verilog defines are obtained from CW305.py.
-            # Otherwise, we look for it in a default location; if that doesn't exist, revert to CW305.py and warn user.
+            # Unless explicitly provided, Verilog defines are obtained from their default location (default_verilog_defines_full_path).
+            # Warn if defines files are not provided and a specific bsfile *is* provided, because that's probably not what one wants.
             found_defines = False
             if defines_files is None:
-                if fpga_id is None:
-                    verilog_defines = [self.default_verilog_defines_full_path]
-                    if os.path.isfile(verilog_defines[0]):
-                        found_defines = True
-                    else:
-                        target_logger.warning("Verilog defines not found in default location (%s).\nUsing defines from CW305.py.If this isn't what you want, either add 'slurp=False', or provide defines location in 'defines_files'" % verilog_defines[0])
-                if not found_defines:
-                    from chipwhisperer.hardware.firmware.cw305 import getsome
-                    verilog_defines = [getsome(self.default_verilog_defines)]
+                verilog_defines = [self.default_verilog_defines_full_path]
+                if custom_bitstream:
+                    target_logger.warning("Using default Verilog defines (%s); if this is not what you want, provide them via the defines_files argument" % self.default_verilog_defines_full_path)
             else:
                 verilog_defines = defines_files
             self.slurp_defines(verilog_defines)
 
 
     def dis(self):
-        # if self._naeusb:
-        self._naeusb.close()
+        if self._naeusb:
+            self._naeusb.close()
+        if self.ss2:
+            self.ss2.ser.close()
 
     def checkEncryptionKey(self, key):
-        """Validate encryption key"""
+        """Validate encryption key."""
         return key
 
     def loadEncryptionKey(self, key):
-        """Write encryption key to FPGA"""
+        """Write encryption key to FPGA."""
         if self.REG_CRYPT_KEY is None:
             target_logger.error("target.REG_CRYPT_KEY unset. Have you given target a verilog defines file?")
             return
@@ -369,7 +614,7 @@ class CW305(TargetTemplate, ChipWhispererCommonInterface):
         self.fpga_write(self.REG_CRYPT_KEY, key)
 
     def loadInput(self, inputtext):
-        """Write input to FPGA"""
+        """Write input to FPGA."""
         if self.REG_CRYPT_TEXTIN is None:
             target_logger.error("target.REG_CRYPT_TEXTIN unset. Have you given target a verilog defines file?")
             return
@@ -378,21 +623,25 @@ class CW305(TargetTemplate, ChipWhispererCommonInterface):
         self.fpga_write(self.REG_CRYPT_TEXTIN, text)
 
     def is_done(self):
-        """Check if FPGA is done"""
-        if (self.REG_CRYPT_GO is None) or (self.REG_USER_LED is None):
-            target_logger.error("target.REG_CRYPT_GO or target.REG_USER_LED unset. Have you given target a verilog defines file?")
-            return
-        result = self.fpga_read(self.REG_CRYPT_GO, 1)[0]
-        if result == 0x01:
-            return False
+        """Check if FPGA is done."""
+        if self.check_done:
+            if (self.REG_CRYPT_GO is None) or (self.REG_USER_LED is None):
+                target_logger.error("target.REG_CRYPT_GO or target.REG_USER_LED unset. Have you given target a verilog defines file?")
+                return
+            result = self.fpga_read(self.REG_CRYPT_GO, 1)[0]
+            if result == 0x01:
+                return False
+            else:
+                if self.toggle_user_led:
+                    self.fpga_write(self.REG_USER_LED, [0])
+                return True
         else:
-            self.fpga_write(self.REG_USER_LED, [0])
             return True
 
     isDone = camel_case_deprecated(is_done)
 
     def readOutput(self):
-        """"Read output from FPGA"""
+        """Read output from FPGA."""
         if self.REG_CRYPT_CIPHEROUT is None:
             target_logger.error("target.REG_CRYPT_CIPHEROUT unset. Have you given target a verilog defines file?")
             return
@@ -404,7 +653,8 @@ class CW305(TargetTemplate, ChipWhispererCommonInterface):
     def _getCWType(self):
         return 'cw305'
 
-    @property
+    @property # type: ignore
+    @check_cw305
     def clkusbautooff(self):
         """ If set, the USB clock is automatically disabled on capture.
 
@@ -420,18 +670,21 @@ class CW305(TargetTemplate, ChipWhispererCommonInterface):
         """
         return self._clkusbautooff
 
-    @clkusbautooff.setter
+    @clkusbautooff.setter # type: ignore
+    @check_cw305
     def clkusbautooff(self, state):
         self._clkusbautooff = state
 
-    @property
+    @property # type: ignore
+    @check_cw305
     def clksleeptime(self):
         """ Time (in milliseconds) that the USB clock is disabled for upon
         capture, if self.clkusbautooff is set.
         """
         return self._clksleeptime
 
-    @clksleeptime.setter
+    @clksleeptime.setter # type: ignore
+    @check_cw305
     def clksleeptime(self, value):
         self._clksleeptime = value
 
@@ -440,20 +693,23 @@ class CW305(TargetTemplate, ChipWhispererCommonInterface):
         if (self.REG_USER_LED is None):
             target_logger.error("target.REG_USER_LED unset. Have you given target a verilog defines file?")
             return
-        if self.clkusbautooff:
-            self.usb_clk_setenabled(False)
+        if self.platform == 'cw305' and self.clkusbautooff:
+                self.usb_clk_setenabled(False)
 
-        self.fpga_write(self.REG_USER_LED, [0x01])
+        if self.toggle_user_led:
+            self.fpga_write(self.REG_USER_LED, [0x01])
+            time.sleep(0.001)
 
-        time.sleep(0.001)
-        self.usb_trigger_toggle()
-        # it's also possible to 'go' via register write but that won't take if
-        # the USB clock was turned off:
-        #self.fpga_write(self.REG_CRYPT_GO, [1])
+        if self.platform == 'cw305':
+            self.usb_trigger_toggle()
+        else:
+            # this could also be done on the cw305 but it won't take if the USB clock was turned off:
+            self.fpga_write(self.REG_CRYPT_GO, [1])
 
-        if self.clkusbautooff:
+        if self.platform == 'cw305' and self.clkusbautooff:
             time.sleep(self.clksleeptime/1000.0)
             self.usb_clk_setenabled(True)
+
 
     def simpleserial_read(self, cmd, pay_len, end='\n', timeout=250, ack=True):
         """Read data from target
@@ -502,7 +758,7 @@ class CW305(TargetTemplate, ChipWhispererCommonInterface):
         else:
             raise ValueError("Unknown command {}".format(cmd))
 
-    def set_key(self, key, ack=False, timeout=250):
+    def set_key(self, key, ack=False, timeout=250, always_send=False):
         """Checks if key is different from the last one sent. If so, send it.
 
         Args:
@@ -513,13 +769,13 @@ class CW305(TargetTemplate, ChipWhispererCommonInterface):
         .. versionadded:: 5.1
             Added set_key to CW305
         """
-        if self.last_key != key:
+        if (self.last_key != key) or always_send:
             self.last_key = key
             self.simpleserial_write('k', key)
 
     def batchRun(self,batchsize=1024,random_key=True,random_pt=True,seed=None):
         """
-            Run multiple encryptions on random data
+            Run multiple encryptions on random data.
 
             Args:
                 batchsize (int): The number of encryption to run (default 1024).
@@ -559,6 +815,7 @@ class CW305(TargetTemplate, ChipWhispererCommonInterface):
                     seed &= 0xffffffff
         return key,pt
 
+    @check_cw305
     def sam3u_write(self, addr, data):
         """Write to an address on the FPGA
 
@@ -577,6 +834,7 @@ class CW305(TargetTemplate, ChipWhispererCommonInterface):
         return self._naeusb.cmdWriteMem(addr, data)
 
     # @fw_ver_required(0, 30)
+    @check_cw305
     def spi_mode(self, enable=True, timeout=200, bsfile=None, prog_speed=10E6):
         """Enter programming mode for the onboard SPI chip
         
@@ -619,6 +877,7 @@ class CW305(TargetTemplate, ChipWhispererCommonInterface):
         spi.enable_interface(enable)
         return spi
 
+    @check_cw305
     def gpio_mode(self, timeout=200):
         """Allow arbitrary GPIO access on SAM3U
         
@@ -698,7 +957,7 @@ class FPGASPI:
         
         
     def enable_interface(self, enable):
-        """Enable or disable the SPI interface
+        """Enable or disable the SPI interface.
         
         Args:
             enable (bool): Enable (True) or disable (False) SPI interface
@@ -709,7 +968,7 @@ class FPGASPI:
             self.sendCtrl(self.REQ_FPGASPI_PROGRAM, 0xA1)
         
     def set_cs_pin(self, status):
-        """Set the SPI pin high or low
+        """Set the SPI pin high or low.
         
         Args:
             status (bool): Set CS pin high (True) or low (False)
@@ -720,7 +979,7 @@ class FPGASPI:
             self.sendCtrl(self.REQ_FPGASPI_PROGRAM, 0xA2)        
 
     def spi_tx_rx(self, data):
-        """Write up to 64 bytes of data to the SPI chip
+        """Write up to 64 bytes of data to the SPI chip.
         
         Args:
             data (list): Write data over the SPI interface
@@ -748,7 +1007,7 @@ class FPGASPI:
         self.set_cs_pin(True)
             
     def erase_chip(self, timeout=None):
-        """Erase the whole SPI chip. Slow (~25s)
+        """Erase the whole SPI chip. Slow (~25s).
 
         Args:
             timeout (int): Timeout in ms. If None, set to 0xFFFFFFFF (approx 1000 hours)
@@ -764,7 +1023,7 @@ class FPGASPI:
         self.wait_busy(timeout)
         
     def wait_busy(self, timeout=1000):
-        """Wait for the busy status on the FPGA to clear
+        """Wait for the busy status on the FPGA to clear.
         
         Args:
             timeout (int): Timeout in ms. If None, set to 0xFFFFFFFF (approx 1000 hours)
@@ -787,9 +1046,7 @@ class FPGASPI:
         self.set_cs_pin(True)
         
     def cmd_write_mem(self, data, addr=0x000000, timeout=1000):
-        """Write up to a page of data
-        
-        For the default chip, a page is 256 bytes.
+        """Write up to a page of data. For the default chip, a page is 256 bytes.
 
         Args:
             data (list): Data to write
@@ -823,9 +1080,7 @@ class FPGASPI:
         self.wait_busy(timeout)
         
     def cmd_read_mem(self, length, addr):
-        """Read up to a page of data
-        
-        For the default chip, a page is 256 bytes
+        """Read up to a page of data. For the default chip, a page is 256 bytes.
 
         Args:
             length (int): Length of data to read
@@ -874,7 +1129,7 @@ class FPGASPI:
             self.verify(data, addr)
             
     def verify(self, data, addr=0x000000):
-        """Verify the data on the SPI chip
+        """Verify the data on the SPI chip.
         
         Args:
             data (list): data to verify
@@ -894,7 +1149,7 @@ class FPGASPI:
             data_read += to_read
             
     def read(self, length, addr=0x000000):
-        """Read data on the SPI chip
+        """Read data on the SPI chip.
         
         Args:
             length (int): Length of data to read
@@ -912,7 +1167,7 @@ class FPGASPI:
         return ret
         
     def erase_block(self, addr, size="4K", timeout=1000):
-        """Erase a block on the SPI chip. See spi.ERASE_BLOCK for available erase lengths
+        """Erase a block on the SPI chip. See spi.ERASE_BLOCK for available erase lengths.
         
         Args:
             addr (int): Address to erase from
@@ -940,9 +1195,10 @@ class FPGAIO:
     such as the external IO interface, and basically anything else you can find.
     
     The pin names are strings, and come from one of three sources:
-        * SAM3U pin names, such as "PC11", "PB9", etc.
-        * Net names from the CW305 schematic such as "USB_A20".
-        * The FPGA ball location that is connected to the SAM3U pin, such as "M2".
+
+    * SAM3U pin names, such as "PC11", "PB9", etc.
+    * Net names from the CW305 schematic such as "USB_A20".
+    * The FPGA ball location that is connected to the SAM3U pin, such as "M2".
     
     Any function taking a pin name assumes you pass a string with one of those. You
     do not need to specify your source - it will autodetect the pin name (if possible).
@@ -982,7 +1238,8 @@ class FPGAIO:
         response = io.spi1_transfer(somedata)
         print(response)
 
-    If you want to see all possible pin names, you can access them with:
+    If you want to see all possible pin names, you can access them with::
+
         io.SAM3U_PIN_NAMES.keys()
         io.SCHEMATIC_PIN_NAMES.keys()
         io.FPGA_PIN_NAMES.keys()
@@ -1342,3 +1599,15 @@ class FPGAIO:
         self.spi1_set_cs_pin(True)
 
         return resp
+
+
+class SS2_CW305_NoPll():
+    """ This is provided so that any target.pll calls (e.g. from an unmodified CW305 script) provide
+    the user with an informative message.
+    """
+    def __getattr__(self, name):
+        target_logger.warning("Unlike the CW305, this target does not have PLL hardware. You can instead control its clock from your ChipWhisperer capture hardware.")
+        def wrapper(*args, **kwargs):
+            pass
+        return wrapper
+

@@ -25,6 +25,7 @@
 from ....hardware.naeusb.bootloader_sam3u import Samba
 from ....logging import *
 import time
+import os
 
 def get_at91_ports():
     from serial.tools import list_ports # type: ignore
@@ -43,9 +44,9 @@ class SAMFWLoader:
 
     Autoprogram Example:
 
-     #. Attach the scope part of the hardware to your computer.
+    #. Attach the scope part of the hardware to your computer.
 
-     #. Connect to the scope using::
+    #. Connect to the scope using::
 
             import chipwhisperer as cw
 
@@ -103,7 +104,7 @@ class SAMFWLoader:
 
         Two methods:
 
-         #. Using the firmware_path::
+        #. Using the firmware_path::
 
                 # the firmware file is included with chipwhisperer
                 # and is the .bin file from the FW build
@@ -111,7 +112,7 @@ class SAMFWLoader:
                 # directory.
                 programmer.program(<port>, <path to firmware file>)
 
-         #. Using the hardware_type (recommended)::
+        #. Using the hardware_type (recommended)::
 
                 programmer.program(<port>, hardware_type='cwlite')
                 programmer.program(<port>, hardware_type='cwnano')
@@ -168,14 +169,17 @@ class SAMFWLoader:
             self.usb.enterBootloader(True)
             del self.scope
 
-    def auto_program(self):
+    def auto_program(self, fw_path=None):
         """Erase and program firmware of ChipWhisperer
 
         Autodetects comport and hardware type.
         """
         import serial.tools.list_ports # type: ignore
-        if not self._hw_type:
-            raise OSError("Unable to detect chipwhisperer hardware type")
+        if fw_path:
+            if not os.path.exists(fw_path):
+                raise OSError("File {} does not exist. Firmware has not been erased.".format(fw_path))
+        if (not self._hw_type) and (not fw_path):
+            raise OSError("Unable to detect chipwhisperer hardware type and firmware not specified")
         before = serial.tools.list_ports.comports()
         before = get_at91_ports()
         # time.sleep(0.5)
@@ -192,7 +196,10 @@ class SAMFWLoader:
             raise OSError("Could not detect COMPORT. Continue using programmer.program()")
         com = candidate[0]
         print("Detected com port {}".format(com))
-        self.program(com, hardware_type=self._hw_type)
+        if fw_path:
+            self.program(com, fw_path=fw_path)
+        else:
+            self.program(com, hardware_type=self._hw_type)
 
 
     def program(self, port, fw_path=None, hardware_type=None, bypass_warning=False):
@@ -212,9 +219,12 @@ class SAMFWLoader:
             'cwlite',
             'cwnano',
             'cw305',
+            'cw310',
+            'cw340',
             'cw1200',
             'cwbergen',
-            'cwhusky'
+            'cwhusky',
+            'cwhuskyplus'
         ]
 
 
@@ -234,26 +244,10 @@ class SAMFWLoader:
                 message = 'Invalid hardware type {}, needs to be one of: ({})'
                 raise TypeError(message.format(hardware_type, ', '.join(type_whitelist)))
             else:
-                if hardware_type == 'cwlite':
-                    from ....hardware.firmware.cwlite import getsome
-                    name = 'SAM3U_CW1173.bin'
-                elif hardware_type == 'cwnano':
-                    from ....hardware.firmware.cwnano import getsome
-                    name = 'SAM3U_CWNANO.bin'
-                elif hardware_type == 'cw305':
-                    from ....hardware.firmware.cw305 import getsome
-                    name = 'SAM3U_CW305.bin'
-                elif hardware_type == 'cw1200':
-                    from ....hardware.firmware.cw1200 import getsome
-                    name = 'CW1200_SAM3UFW.bin'
-                elif hardware_type == 'cwbergen':
-                    from ....hardware.firmware.cwbergen import getsome
-                    name = 'CW310.bin'
-                elif hardware_type == 'cwhusky':
-                    from ....hardware.firmware.cwhusky import getsome
-                    name = 'Husky.bin'
+                from ....hardware.firmware.open_fw import mcufw
                 self.logfunc('Loading {} firmware...'.format(hardware_type))
-                fw_data = getsome(name).read()
+                fw_data = mcufw(hardware_type, False)
+                name = "{}/mcufw.bin".format(hardware_type)
 
         if fw_path:
             self.logfunc("Opening firmware...")
@@ -274,13 +268,18 @@ class SAMFWLoader:
             sam.flash.setBootFlash(1)
 
             i = 0
+                
             while not sam.flash.getBootFlash():
+                sam.flash.setBootFlash(1)
+                if sam.flash.name == "ATSAM4S2":
+                    break #IIRC there's a bug on the SAM4S that prevents this from being read TODO: check errata
                 time.sleep(0.05)
                 i += 1
                 if i > 10:
+                    sam.reset()
                     sam.ser.close()
                     self.logfunc("Upgrade succeded")
-                    self.logfunc("Unable to set boot flash, please power cycle")
+                    self.logfunc("Unable to set boot flash, may need to power cycle")
                     return True
 
             self.logfunc("Resetting...")

@@ -28,20 +28,12 @@ from ....logging import *
 import zipfile
 import datetime
 import math
-from collections import OrderedDict
 from ....capture.scopes.cwhardware import PartialReconfiguration as pr
 from ....common.utils import util
+from typing import Union, List
 
-powerdownaddr = 49
-glitchrepeats = 50
-glitchaddr = 51
-glitchnumaddr = 52
-glitchstate = 53
-glitchoffsetaddr = 25
-glitchreadbackaddr = 56
 CODE_READ       = 0x80
 CODE_WRITE      = 0xC0
-
 
 # sign extend b low bits in x
 # from "Bit Twiddling Hacks"
@@ -49,6 +41,32 @@ def SIGNEXT(x, b):
     m = 1 << (b - 1)
     x = x & ((1 << b) - 1)
     return (x ^ m) - m
+
+class MultiGlitchList(list):
+    """Class that behaves like a list, but can set individual elements using a getter/setter
+
+    Useful so that we can do scope.glitch.ext_offset[1] = 5 with Husky multi-glitch
+    """
+    def __setitem__(self, *args, **kwargs):
+        oldval = self._getter()
+        oldval[args[0]] = args[1]
+        self._setter(oldval)
+        pass
+
+    def __repr__(self):
+        oldrepr = super().__repr__()
+        return f"MultiGlitchList({oldrepr})"
+
+    def __init__(self, *args, **kwargs):
+        if "getter" not in kwargs:
+            raise KeyError("MultiGlitchList requires a getter")
+        if "setter" not in kwargs:
+            raise KeyError("MultiGlitchList requires a setter")
+        
+        self._getter = kwargs.pop("getter")
+        self._setter = kwargs.pop("setter")
+        super().__init__(*args, **kwargs)
+        
 
 class GlitchSettings(util.DisableNewAttr):
 
@@ -72,18 +90,18 @@ class GlitchSettings(util.DisableNewAttr):
     def __init__(self, cwglitch):
         super().__init__()
         self.cwg = cwglitch
-        self._is_husky = self.cwg.cwtype == 'cwhusky'
+        self._is_husky = self.cwg.cwtype in ['cwhusky', 'cwhuskyplus']
         self.pll = None
         self.disable_newattr()
 
     def _dict_repr(self):
-        rtn = OrderedDict()
+        rtn = {}
 
         if self._is_husky:
             rtn['enabled'] = self.enabled
-            rtn['mmcm_locked'] = self.mmcm_locked
             rtn['num_glitches'] = self.num_glitches
         rtn['clk_src'] = self.clk_src
+        rtn['mmcm_locked'] = self.mmcm_locked
         rtn['width'] = self.width
         if not self._is_husky:
             rtn['width_fine'] = self.width_fine
@@ -106,18 +124,18 @@ class GlitchSettings(util.DisableNewAttr):
     def __str__(self):
         return self.__repr__()
 
-    def manual_trigger(self):
+    def manual_trigger(self) -> None:
         """Manually trigger the glitch output.
 
-        This trigger is most useful in Manual trigger mode, where this is the
-        only way to cause a glitch.
+        This method only inserts a glitch in manual trigger mode. In this
+        mode, it is likewise the only way to insert a glitch.
         """
         self.cwg.glitchManual()
         
     def manualTrigger(self):
         self.manual_trigger()
 
-    def readStatus(self):
+    def readStatus(self) -> tuple:
         """Read the status of the two glitch DCMs.
 
         Returns:
@@ -139,13 +157,14 @@ class GlitchSettings(util.DisableNewAttr):
         self.cwg.resetDCMs(keepPhase)
 
     @property
-    def clk_src(self):
+    def clk_src(self) -> str:
         """The clock signal that the glitch DCM is using as input.
 
         This DCM can be clocked from three different sources:
-         * "target": The HS1 clock from the target device
-         * "clkgen": The CLKGEN DCM output (N/A for Husky)
-         * "pll": Husky's on-board PLL clock (Husky only)
+
+        * "target": The HS1 clock from the target device (can also be AUX clock for Husky)
+        * "clkgen": The CLKGEN DCM output (N/A for Husky)
+        * "pll": Husky's on-board PLL clock (Husky only)
 
         :Getter:
            Return the clock signal currently in use
@@ -167,7 +186,7 @@ class GlitchSettings(util.DisableNewAttr):
             raise ValueError("Received unexpected glitch module clock source %s" % (clk_val), clk_val)
 
     @clk_src.setter
-    def clk_src(self, source):
+    def clk_src(self, source : str):
         if source == "target":
             clk_val = self.cwg.CLKSOURCE0_BIT
         elif source == "clkgen":
@@ -187,7 +206,7 @@ class GlitchSettings(util.DisableNewAttr):
         self.cwg.setGlitchClkSource(clk_val)
 
     @property
-    def phase_shift_steps(self):
+    def phase_shift_steps(self) -> int:
         """The number of phase shift steps per target clock period.
         Husky only.
         To change, modify clock.pll.update_fpga_vco()
@@ -201,7 +220,7 @@ class GlitchSettings(util.DisableNewAttr):
 
 
     @property
-    def enabled(self):
+    def enabled(self) -> bool:
         """Husky only. Whether the Xilinx MMCMs used to generate glitches are
         powered on or not. 7-series MMCMs are power hungry and are estimated
         to consume half of the FPGA's power. If you run into temperature
@@ -213,7 +232,7 @@ class GlitchSettings(util.DisableNewAttr):
         return self.cwg.getEnabled()
 
     @enabled.setter
-    def enabled(self, enable):
+    def enabled(self, enable : bool):
         if not self._is_husky:
             raise ValueError("For CW-Husky only.")
         self.cwg.setEnabled(enable)
@@ -221,16 +240,14 @@ class GlitchSettings(util.DisableNewAttr):
 
     @property
     def mmcm_locked(self):
-        """Husky only. Whether the Xilinx MMCMs used to generate glitches are
-        locked or not.
+        """Whether the Xilinx MMCMs (aka DCMs/PLLs) used to generate glitches
+        are locked or not.
 
         """
-        if not self._is_husky:
-            raise ValueError("For CW-Husky only.")
         return self.cwg.getMMCMLocked()
 
     @property
-    def num_glitches(self):
+    def num_glitches(self) -> int:
         """The number of glitch events to generate. CW-Husky only.
 
         Each glitch event uses the same offset and width settings. 
@@ -238,6 +255,8 @@ class GlitchSettings(util.DisableNewAttr):
 
         This parameter has no effect when scope.glitch.trigger_src is set to
         "manual" or "continuous".
+
+        .. note:: Subsequent glitches are offset from the previous glitch.
 
         Raises:
            ValueError: number outside of [1, 32].
@@ -247,7 +266,7 @@ class GlitchSettings(util.DisableNewAttr):
         return self.cwg.getNumGlitches()
 
     @num_glitches.setter
-    def num_glitches(self, num):
+    def num_glitches(self, num : int):
         if not self._is_husky:
             raise ValueError("For CW-Husky only.")
         self.cwg.setNumGlitches(num)
@@ -260,7 +279,7 @@ class GlitchSettings(util.DisableNewAttr):
         """
         if not self._is_husky:
             raise ValueError("For CW-Husky only.")
-        return self.cwg.getActualNumGlitches()
+        return self.cwg.getNumActualGlitches()
 
     @property
     def state(self):
@@ -278,7 +297,7 @@ class GlitchSettings(util.DisableNewAttr):
         self.cwg.resetState()
 
     @property
-    def width(self):
+    def width(self) -> Union[float, int]:
         """The width of a single glitch pulse.
         
         For CW-Husky, width is expressed as the number of phase shift steps.
@@ -308,11 +327,11 @@ class GlitchSettings(util.DisableNewAttr):
         return self.cwg.getGlitchWidth()
 
     @width.setter
-    def width(self, value):
+    def width(self, value : Union[float, int]):
         self.cwg.setGlitchWidth(value)
 
     @property
-    def width_fine(self):
+    def width_fine(self) -> int:
         """The fine adjustment value on the glitch width. N/A for Husky.
 
         This is a dimensionless number that makes small adjustments to the
@@ -331,7 +350,7 @@ class GlitchSettings(util.DisableNewAttr):
         return self.cwg.getGlitchWidthFine()
 
     @width_fine.setter
-    def width_fine(self, value):
+    def width_fine(self, value : int):
         if self._is_husky:
             glitch_logger.error("N/A for Husky")
         try:
@@ -344,7 +363,7 @@ class GlitchSettings(util.DisableNewAttr):
         self.cwg.setGlitchWidthFine(int_val)
 
     @property
-    def offset(self):
+    def offset(self) -> Union[float, int]:
         """The offset from a rising clock edge to a glitch pulse rising edge.
 
         For CW-Husky, offset is expressed as the number of phase shift steps.
@@ -378,11 +397,11 @@ class GlitchSettings(util.DisableNewAttr):
         return self.cwg.getGlitchOffset()
 
     @offset.setter
-    def offset(self, value):
+    def offset(self, value : Union[float, int]):
         self.cwg.setGlitchOffset(value)
 
     @property
-    def offset_fine(self):
+    def offset_fine(self) -> int:
         """The fine adjustment value on the glitch offset. N/A for Husky.
 
         This is a dimensionless number that makes small adjustments to the
@@ -401,7 +420,7 @@ class GlitchSettings(util.DisableNewAttr):
         return self.cwg.getGlitchOffsetFine()
 
     @offset_fine.setter
-    def offset_fine(self, value):
+    def offset_fine(self, value : int):
         if self._is_husky:
             glitch_logger.error("N/A for Husky")
         try:
@@ -414,25 +433,27 @@ class GlitchSettings(util.DisableNewAttr):
         self.cwg.setGlitchOffsetFine(int_val)
 
     @property
-    def trigger_src(self):
+    def trigger_src(self) -> str:
         """The trigger signal for the glitch pulses.
 
         The glitch module can use four different types of triggers:
-         * "continuous": Constantly trigger glitches. The following
-            scope.glitch parameters have no bearing in this mode: ext_offset,
-            repeat, num_glitches.
-         * "manual": Only trigger glitches by calling manual_trigger(). The
-            following scope.glitch parameters have no bearing in this mode:
-            ext_offset, num_glitches.
-         * "ext_single": Use the trigger module. Once the scope is armed, one
-            set of glitch events is emitted when the trigger condition is
-            satisfied. Subsequent trigger conditions are ignored unless the
-            scope is re-armed.
-         * "ext_continuous": Use the trigger module. A set of glitch events is
-            emitted each time the trigger condition is satisfied, whether or
-            not the scope is armed.
 
-         .. warning:: calling :code:`scope.arm()` in manual gitch mode will cause a glitch to trigger.
+        * "continuous": Constantly trigger glitches. The following
+          scope.glitch parameters have no bearing in this mode: ext_offset,
+          repeat, num_glitches.
+        * "manual": Only trigger glitches by calling :code:`manual_trigger()`. The
+          following scope.glitch parameters have no bearing in this mode:
+          ext_offset, num_glitches. In this mode, calling :code:`scope.arm()` will
+          trigger a glitch as well.
+        * "ext_single": Use the trigger module. Once the scope is armed, one
+          set of glitch events is emitted when the trigger condition is
+          satisfied. Subsequent trigger conditions are ignored unless the
+          scope is re-armed.
+        * "ext_continuous": Use the trigger module. A set of glitch events is
+          emitted each time the trigger condition is satisfied, whether or
+          not the scope is armed.
+
+        .. warning:: calling :code:`scope.arm()` in manual gitch mode will cause a glitch to trigger.
 
         :Getter: Return the current trigger source.
 
@@ -445,7 +466,7 @@ class GlitchSettings(util.DisableNewAttr):
         return self._glitch_triggers[trig_src]
 
     @trigger_src.setter
-    def trigger_src(self, src):
+    def trigger_src(self, src : str):
         try:
             trig_idx = self._glitch_triggers.index(src)
         except ValueError as e:
@@ -454,15 +475,15 @@ class GlitchSettings(util.DisableNewAttr):
         self.cwg.setGlitchTrigger(trig_idx)
 
     @property
-    def arm_timing(self):
+    def arm_timing(self) -> str:
         """When to arm the glitch in single-shot mode.
 
         If the glitch module is in "ext_single" trigger mode, it must be armed
         when the scope is armed. There are two timings for this event:
 
-         * "no_glitch": The glitch module is not armed. Gives a moderate speedup to capture.
-         * "before_scope": The glitch module is armed first.
-         * "after_scope": The scope is armed first. This is the default.
+        * "no_glitch": The glitch module is not armed. Gives a moderate speedup to capture.
+        * "before_scope": The glitch module is armed first.
+        * "after_scope": The scope is armed first. This is the default.
 
         This setting may be helpful if trigger events are happening very early.
 
@@ -487,7 +508,7 @@ class GlitchSettings(util.DisableNewAttr):
             raise ValueError("Received unexpected glitch arm timing %s" % (timing), timing)
 
     @arm_timing.setter
-    def arm_timing(self, value):
+    def arm_timing(self, value : str):
         if value == "no_glitch":
             int_val = 0
         elif value == "before_scope":
@@ -500,7 +521,7 @@ class GlitchSettings(util.DisableNewAttr):
         self.cwg.setArmTiming(int_val)
 
     @property
-    def ext_offset(self):
+    def ext_offset(self) -> Union[int, list]:
         """How long the glitch module waits between a trigger and a glitch.
 
         After the glitch module is triggered, it waits for a number of clock
@@ -510,7 +531,9 @@ class GlitchSettings(util.DisableNewAttr):
 
         For CW-Husky when scope.glitch.num_glitches > 1, this parameter is a
         list with scope.glitch.num_glitches elements, each element
-        representing the ext_offset value for the corresponding glitch.
+        representing the ext_offset value for the corresponding glitch,
+        relative to the previous glitch. If ext_offset[i] = j, glitch i will
+        be issued 2+j cycles after the start of glitch i-1.
 
         For CW-Lite/Pro, scope.glitch.num_glitches is not supported so this is
         a simply an integer.
@@ -525,7 +548,8 @@ class GlitchSettings(util.DisableNewAttr):
 
         :Getter: Return the current external trigger offset(s). For CW-lite/pro
            or when num_glitches=1, this is an integer (for backwards
-           compatibility).  Otherwise, it is a list of integers.
+           compatibility).  Otherwise, it is a MultiGlitchList, which behaves as a list,
+           but allows ext_offset[x] = y to set settings for glitch x.
 
         :Setter: Set the external trigger offset(s). Integer for CW-lite/pro,
            list of integers for Husky.
@@ -541,7 +565,7 @@ class GlitchSettings(util.DisableNewAttr):
         self.cwg.setTriggerOffset(offset)
 
     @property
-    def repeat(self):
+    def repeat(self) -> Union[int, list]:
         """The number of glitch pulses to generate per trigger.
 
         When the glitch module is triggered, it produces a number of pulses
@@ -551,7 +575,10 @@ class GlitchSettings(util.DisableNewAttr):
 
         For CW-Husky when scope.glitch.num_glitches > 1, this parameter is a
         list with scope.glitch.num_glitches elements, each element
-        representing the repeat value for the corresponding glitch.
+        representing the repeat value for the corresponding glitch. The
+        maximum legal value for repeat[i] is ext_offset[i+1]+1. If an
+        illegal value is specified, the glitch output may be held high for
+        up to 8192 cycles.
 
         For CW-Lite/Pro, scope.glitch.num_glitches is not supported so this is
         a simply an integer.
@@ -578,21 +605,22 @@ class GlitchSettings(util.DisableNewAttr):
         self.cwg.setRepeat(value)
 
     @property
-    def output(self):
+    def output(self) -> str:
         """The type of output produced by the glitch module.
 
         There are 5 ways that the glitch module can combine the clock with its
         glitch pulses:
 
-         * "clock_only": Output only the original input clock.
-         * "glitch_only": Output only the glitch pulses - do not use the clock.
-         * "clock_or": Output is high if either the clock or glitch are high.
-         * "clock_xor": Output is high if clock and glitch are different.
-         * "enable_only": Output is high for glitch.repeat cycles.
+        * "clock_only": Output only the original input clock.
+        * "glitch_only": Output only the glitch pulses - do not use the clock.
+        * "clock_or": Output is high if either the clock or glitch are high.
+        * "clock_xor": Output is high if clock and glitch are different.
+        * "enable_only": Output is high for glitch.repeat cycles.
 
         Some of these settings are only useful in certain scenarios:
-         * Clock glitching: "clock_or" or "clock_xor"
-         * Voltage glitching: "glitch_only" or "enable_only"
+
+        * Clock glitching: "clock_or" or "clock_xor"
+        * Voltage glitching: "glitch_only" or "enable_only"
 
         :Getter: Return the current glitch output mode (one of above strings)
 
@@ -605,7 +633,7 @@ class GlitchSettings(util.DisableNewAttr):
         return self._output_modes[output_mode]
 
     @output.setter
-    def output(self, value):
+    def output(self, value : str):
         try:
             output_idx = self._output_modes.index(value)
         except ValueError as e:
@@ -630,7 +658,7 @@ class ChipWhispererGlitch(object):
         self.prEnabled = False
         self.oa = oa
         self.cwtype = cwtype
-        if cwtype == 'cwhusky':
+        if cwtype in ['cwhusky', 'cwhuskyplus']:
             self._is_husky = True
         else:
             self._is_husky = False
@@ -674,7 +702,7 @@ class ChipWhispererGlitch(object):
                 settingprefix = "cw1200"
                 partialbasename = "cw1200"
                 self.glitchPR = pr.PartialReconfigDataMulti()
-            elif cwtype == "cwhusky":
+            elif cwtype in ["cwhusky", "cwhuskyplus"]:
                 settingprefix = "cwhusky"
                 partialbasename = "cwhusky"
                 self.glitchPR = None
@@ -796,7 +824,7 @@ class ChipWhispererGlitch(object):
         cmd[6] = int(width) & 0xff
         cmd[7] = int(("%f"%width).split(".")[1][0:2]) & 0xff
 
-        self.oa.sendMessage(CODE_WRITE, glitchreadbackaddr, cmd, Validate=False)
+        self.oa.sendMessage(CODE_WRITE, "GLITCH_RECONFIG_RB_ADDR", cmd, Validate=False)
 
     def getPhaseShiftSteps(self):
         """Husky only. Returns number of phase shift steps in one target pll
@@ -811,12 +839,12 @@ class ChipWhispererGlitch(object):
             val = [0]
         else:
             val = [1]
-        self.oa.sendMessage(CODE_WRITE, powerdownaddr, val, Validate=False)
+        self.oa.sendMessage(CODE_WRITE, "CLOCKGLITCH_POWERDOWN", val, Validate=False)
         if self._is_husky and enable:
             self.resetDCMs(keepPhase=False)
 
     def getEnabled(self):
-        raw = self.oa.sendMessage(CODE_READ, powerdownaddr, Validate=False, maxResp=1)[0]
+        raw = self.oa.sendMessage(CODE_READ, "CLOCKGLITCH_POWERDOWN", Validate=False, maxResp=1)[0]
         if raw == 1:
             return False
         elif raw == 0:
@@ -828,16 +856,16 @@ class ChipWhispererGlitch(object):
         if num < 1 or num > 32:
             raise ValueError("Allowed range: 1-32");
         self._num_glitches = num
-        self.oa.sendMessage(CODE_WRITE, glitchnumaddr, [num-1], Validate=False)
+        self.oa.sendMessage(CODE_WRITE, "CLOCKGLITCH_NUM_GLITCHES", [num-1], Validate=False)
 
     def getNumGlitches(self):
         return self._num_glitches
 
     def getNumActualGlitches(self):
-        return self.oa.sendMessage(CODE_READ, glitchnumaddr, Validate=False, maxResp=1)[0]
+        return self.oa.sendMessage(CODE_READ, "CLOCKGLITCH_NUM_GLITCHES", Validate=False, maxResp=1)[0]
 
     def getState(self):
-        raw = self.oa.sendMessage(CODE_READ, glitchstate, Validate=False, maxResp=1)[0]
+        raw = self.oa.sendMessage(CODE_READ, "CLOCKGLITCH_MULTIPLE_STATE", Validate=False, maxResp=1)[0]
         if raw == 0:
             return 'idle'
         elif raw == 1:
@@ -850,11 +878,11 @@ class ChipWhispererGlitch(object):
             raise ValueError("Unexpected state value: %d" % raw)
 
     def resetState(self):
-        self.oa.sendMessage(CODE_WRITE, glitchstate, [1], Validate=False)
-        self.oa.sendMessage(CODE_WRITE, glitchstate, [0], Validate=False)
+        self.oa.sendMessage(CODE_WRITE, "CLOCKGLITCH_MULTIPLE_STATE", [1], Validate=False)
+        self.oa.sendMessage(CODE_WRITE, "CLOCKGLITCH_MULTIPLE_STATE", [0], Validate=False)
 
     def getMMCMLocked(self):
-        resp = self.oa.sendMessage(CODE_READ, glitchaddr, Validate=False, maxResp=6)
+        resp = self.oa.sendMessage(CODE_READ, "CLOCKGLITCH_SETTINGS", Validate=False, maxResp=6)
         if ((resp[4] & 0x80) == 0x80) and ((resp[5] & 0x01) == 0x01):
             return True
         else:
@@ -866,13 +894,13 @@ class ChipWhispererGlitch(object):
                 raise ValueError("Can't change glitch settings if not enabled and locked.")
             assert type(width) == int
             self._width = width
-            current = self.oa.sendMessage(CODE_READ, glitchaddr, Validate=False, maxResp=8)
+            current = self.oa.sendMessage(CODE_READ, "CLOCKGLITCH_SETTINGS", Validate=False, maxResp=8)
             LSB = width & 0x00FF
             MSB = (width & 0xFF00) >> 8
             current[0] = LSB
             current[1] = MSB
             current[2] = current[2] | 0x02
-            self.oa.sendMessage(CODE_WRITE, glitchaddr, current, Validate=False)
+            self.oa.sendMessage(CODE_WRITE, "CLOCKGLITCH_SETTINGS", current, Validate=False)
             # Large adjustments can take a while so it's important to check if done. It *is* possible to trigger a glitch, following an adjustment,
             # before the adjustment is complete!
             starttime = datetime.datetime.now()
@@ -882,7 +910,7 @@ class ChipWhispererGlitch(object):
                 if (diff.total_seconds() > self._timeout):
                     scope_logger.warning('Timeout in phase adjustment. Increase self._timeout. This should not be necessary unless you make *huge* width jumps.')
                     break
-                raw = self.oa.sendMessage(CODE_READ, glitchaddr, Validate=False, maxResp=5)
+                raw = self.oa.sendMessage(CODE_READ, "CLOCKGLITCH_SETTINGS", Validate=False, maxResp=5)
                 done = (raw[4] >> 6) & 0x01
 
         else:
@@ -907,13 +935,13 @@ class ChipWhispererGlitch(object):
                 raise ValueError("Can't change glitch settings if not enabled and locked.")
             assert type(offset) == int
             self._offset = offset
-            current = self.oa.sendMessage(CODE_READ, glitchaddr, Validate=False, maxResp=8)
+            current = self.oa.sendMessage(CODE_READ, "CLOCKGLITCH_SETTINGS", Validate=False, maxResp=8)
             LSB = offset & 0x00FF
             MSB = (offset & 0xFF00) >> 8
             current[0] = LSB
             current[1] = MSB
             current[2] = current[2] | 0x01
-            self.oa.sendMessage(CODE_WRITE, glitchaddr, current, Validate=False)
+            self.oa.sendMessage(CODE_WRITE, "CLOCKGLITCH_SETTINGS", current, Validate=False)
             # Large adjustments can take a while so it's important to check if done. It *is* possible to trigger a glitch, following an adjustment,
             # before the adjustment is complete!
             starttime = datetime.datetime.now()
@@ -923,15 +951,13 @@ class ChipWhispererGlitch(object):
                 if (diff.total_seconds() > self._timeout):
                     scope_logger.warning('Timeout in phase adjustment. Increase self._timeout. This should not be necessary unless you make *huge* offset jumps.')
                     break
-                raw = self.oa.sendMessage(CODE_READ, glitchaddr, Validate=False, maxResp=5)
+                raw = self.oa.sendMessage(CODE_READ, "CLOCKGLITCH_SETTINGS", Validate=False, maxResp=5)
                 done = (raw[4] >> 5) & 0x01
 
         else:
             value = offset
             if value < self._min_offset or value > self._max_offset:
                 raise UserWarning("Can't use glitch offset %s - rounding into [%s, %s]" % (value, self._min_offset, self._max_offset))
-            if value < -45:
-                glitch_logger.warning("Negative offsets <-45 may result in double glitches!")
             if offset > self._max_offset:
                 offset = self._max_offset
             if offset < self._min_offset:
@@ -960,12 +986,11 @@ class ChipWhispererGlitch(object):
             if int_val < 0 or int_val >= 2**32:
                 raise ValueError("New trigger offset %d is outside range [0, 2**32)" % int_val)
             raw += int_val * 2**(32*i)
-        self.oa.sendMessage(CODE_WRITE, glitchoffsetaddr, list(int.to_bytes(raw, length=4*len(offsets), byteorder='little')))
+        self.oa.sendMessage(CODE_WRITE, "CLOCKGLITCH_OFFSET", list(int.to_bytes(raw, length=4*len(offsets), byteorder='little')))
 
-    def getTriggerOffset(self):
-        """Get offset between trigger event and glitch in clock cycles"""
+    def readTriggerOffset(self):
         num_glitches = self.getNumGlitches()
-        raw = int.from_bytes(self.oa.sendMessage(CODE_READ, glitchoffsetaddr, maxResp=4*num_glitches), byteorder='little')
+        raw = int.from_bytes(self.oa.sendMessage(CODE_READ, "CLOCKGLITCH_OFFSET", maxResp=4*num_glitches), byteorder='little')
         if num_glitches == 1:
             return raw
         else:
@@ -974,11 +999,19 @@ class ChipWhispererGlitch(object):
                 offsets.append(raw & (2**32-1))
                 raw = raw >> 32
             return offsets
+        
+    def getTriggerOffset(self):
+        """Get offset between trigger event and glitch in clock cycles"""
+        offsets = self.readTriggerOffset()
+        if type(offsets) is int:
+            return offsets
+        else:
+            return MultiGlitchList(offsets, setter=self.setTriggerOffset, getter=self.readTriggerOffset)
 
 
     def setGlitchOffsetFine(self, fine):
         """Set the fine glitch offset adjust, range -255 to 255"""
-        current = self.oa.sendMessage(CODE_READ, glitchaddr, Validate=False, maxResp=8)
+        current = self.oa.sendMessage(CODE_READ, "CLOCKGLITCH_SETTINGS", Validate=False, maxResp=8)
 
         if current is None or len(current) < 8:
             glitch_logger.warning('Glitch Module not present?')
@@ -995,7 +1028,7 @@ class ChipWhispererGlitch(object):
         #assign clockglitch_settings_read[37] = phase1_done_reg;
         #assign clockglitch_settings_read[38] = phase2_done_reg;
 
-        self.oa.sendMessage(CODE_WRITE, glitchaddr, current, Validate=False)
+        self.oa.sendMessage(CODE_WRITE, "CLOCKGLITCH_SETTINGS", current, Validate=False)
 
     def getGlitchWidthFine(self):
         if self._is_husky:
@@ -1004,7 +1037,7 @@ class ChipWhispererGlitch(object):
 
     def setGlitchWidthFine(self, fine):
         """Set the fine glitch width adjust, range -255 to 255"""
-        current = self.oa.sendMessage(CODE_READ, glitchaddr, Validate=False, maxResp=8)
+        current = self.oa.sendMessage(CODE_READ, "CLOCKGLITCH_SETTINGS", Validate=False, maxResp=8)
 
         if current is None or len(current) < 8:
             glitch_logger.warning('Glitch Module not present?')
@@ -1020,7 +1053,7 @@ class ChipWhispererGlitch(object):
         current[2] = current[2] | 0x04  # 23..16
         #assign clockglitch_settings_read[37] = phase1_done_reg;
         # assign clockglitch_settings_read[38] = phase2_done_reg;
-        self.oa.sendMessage(CODE_WRITE, glitchaddr, current, Validate=False)
+        self.oa.sendMessage(CODE_WRITE, "CLOCKGLITCH_SETTINGS", current, Validate=False)
 
     def getGlitchOffsetFine(self):
         if self._is_husky:
@@ -1028,7 +1061,7 @@ class ChipWhispererGlitch(object):
         return self.getDCMStatus()[0]
 
     def getDCMStatus(self):
-        current = self.oa.sendMessage(CODE_READ, glitchaddr, Validate=False, maxResp=8)
+        current = self.oa.sendMessage(CODE_READ, "CLOCKGLITCH_SETTINGS", Validate=False, maxResp=8)
 
         glitch_offset_fine_loaded = current[2] >> 3
         glitch_offset_fine_loaded |= (current[3] & 0x0F) << 5
@@ -1054,11 +1087,11 @@ class ChipWhispererGlitch(object):
         Husky: if keepPhase=True, the previous offset and width settings are automatically re-applied.
         Non-Husky: Required after doing a PR operation
         """
-        reset = self.oa.sendMessage(CODE_READ, glitchaddr, Validate=False, maxResp=8)
+        reset = self.oa.sendMessage(CODE_READ, "CLOCKGLITCH_SETTINGS", Validate=False, maxResp=8)
         reset[5] |= (1<<1)
-        self.oa.sendMessage(CODE_WRITE, glitchaddr, reset, Validate=False)
+        self.oa.sendMessage(CODE_WRITE, "CLOCKGLITCH_SETTINGS", reset, Validate=False)
         reset[5] &= ~(1<<1)
-        self.oa.sendMessage(CODE_WRITE, glitchaddr, reset, Validate=False)
+        self.oa.sendMessage(CODE_WRITE, "CLOCKGLITCH_SETTINGS", reset, Validate=False)
 
         # TODO: should we be doing something with keepPhase if we're not Husky?
 
@@ -1094,23 +1127,22 @@ class ChipWhispererGlitch(object):
                 raise ValueError("New repeat value %d is outside range [1, 8192]" % int_val)
             int_val = int_val-1
             if i == 0:
-                resp = self.oa.sendMessage(CODE_READ, glitchaddr, Validate=False, maxResp=8)
+                resp = self.oa.sendMessage(CODE_READ, "CLOCKGLITCH_SETTINGS", Validate=False, maxResp=8)
                 if resp is None or len(resp) < 8:
                     glitch_logger.warning('Glitch Module not present?')
                     return
                 resp[6] = int_val & 0xff #LSB        
                 resp[7] = (resp[7] & self.CLKSOURCE_MASK) | ((int_val >> 8) << 2) #5-bit MSB stored in upper bits
-                self.oa.sendMessage(CODE_WRITE, glitchaddr, resp, Validate=False)
+                self.oa.sendMessage(CODE_WRITE, "CLOCKGLITCH_SETTINGS", resp, Validate=False)
             else:
                 raw += int_val * 2**(self._repeat_bits*(i-1))
         if len(repeats) > 1:
             bytes_to_write = math.ceil((len(repeats)-1)*self._repeat_bits/8)
-            self.oa.sendMessage(CODE_WRITE, glitchrepeats, list(int.to_bytes(raw, length=bytes_to_write, byteorder='little')))
+            self.oa.sendMessage(CODE_WRITE, "CLOCKGLITCH_REPEATS", list(int.to_bytes(raw, length=bytes_to_write, byteorder='little')))
 
-    def getRepeat(self):
-        """Get number of glitches to occur after a trigger"""
+    def readRepeat(self):
         num_glitches = self.getNumGlitches()
-        resp = self.oa.sendMessage(CODE_READ, glitchaddr, Validate=False, maxResp=8)
+        resp = self.oa.sendMessage(CODE_READ, "CLOCKGLITCH_SETTINGS", Validate=False, maxResp=8)
         num = resp[6]
         num |= ((resp[7] & ~(self.CLKSOURCE_MASK)) >> 2) << 8
         num += 1
@@ -1119,33 +1151,43 @@ class ChipWhispererGlitch(object):
         else:
             repeats = [num]
             bytes_to_read = math.ceil((num_glitches-1)*self._repeat_bits/8)
-            raw = int.from_bytes(self.oa.sendMessage(CODE_READ, glitchrepeats, Validate=False, maxResp=bytes_to_read), byteorder='little')
+            raw = int.from_bytes(self.oa.sendMessage(CODE_READ, "CLOCKGLITCH_REPEATS", Validate=False, maxResp=bytes_to_read), byteorder='little')
             for i in range(1, num_glitches):
                 repeats.append
                 repeats.append((raw & (2**self._repeat_bits-1)) + 1)
                 raw = raw >> self._repeat_bits
             return repeats
+        
+
+    def getRepeat(self):
+        """Get number of glitches to occur after a trigger"""
+        repeats = self.readRepeat()
+        if type(repeats) is int:
+            return repeats
+        else:
+            return MultiGlitchList(repeats, setter=self.setRepeat, getter=self.readRepeat)
+            
 
 
     def setGlitchTrigger(self, trigger):
         """Set glitch trigger type (manual, continous, adc-trigger)"""
-        resp = self.oa.sendMessage(CODE_READ, glitchaddr, Validate=False, maxResp=8)
+        resp = self.oa.sendMessage(CODE_READ, "CLOCKGLITCH_SETTINGS", Validate=False, maxResp=8)
         resp[5] = (resp[5] & ~(0x0C)) | (trigger << 2)
-        self.oa.sendMessage(CODE_WRITE, glitchaddr, resp, Validate=False)
+        self.oa.sendMessage(CODE_WRITE, "CLOCKGLITCH_SETTINGS", resp, Validate=False)
 
     def glitchTrigger(self):
         """Get glitch trigger type"""
-        resp = self.oa.sendMessage(CODE_READ, glitchaddr, Validate=False, maxResp=8)
+        resp = self.oa.sendMessage(CODE_READ, "CLOCKGLITCH_SETTINGS", Validate=False, maxResp=8)
         return (resp[5] & 0x0C) >> 2
 
     def setGlitchType(self, t):
         """Set glitch output type (ORd with clock, XORd with clock, clock only, glitch only)"""
-        resp = self.oa.sendMessage(CODE_READ, glitchaddr, Validate=False, maxResp=8)
+        resp = self.oa.sendMessage(CODE_READ, "CLOCKGLITCH_SETTINGS", Validate=False, maxResp=8)
         resp[5] = (resp[5] & ~(0x70)) | (t << 4)
-        self.oa.sendMessage(CODE_WRITE, glitchaddr, resp, Validate=False)
+        self.oa.sendMessage(CODE_WRITE, "CLOCKGLITCH_SETTINGS", resp, Validate=False)
 
     def glitchType(self):
-        resp = self.oa.sendMessage(CODE_READ, glitchaddr, Validate=False, maxResp=8)
+        resp = self.oa.sendMessage(CODE_READ, "CLOCKGLITCH_SETTINGS", Validate=False, maxResp=8)
         return (resp[5] & 0x70) >> 4
 
     def glitchManual(self, _=None):
@@ -1153,11 +1195,11 @@ class ChipWhispererGlitch(object):
         Cause a single glitch event to occur. Depending on setting of scope.glitch.repeat this may mean
         multiple glitches in a row
         """
-        resp = self.oa.sendMessage(CODE_READ, glitchaddr, Validate=False, maxResp=8)
+        resp = self.oa.sendMessage(CODE_READ, "CLOCKGLITCH_SETTINGS", Validate=False, maxResp=8)
         resp[5] = resp[5] | (1 << 7)
-        self.oa.sendMessage(CODE_WRITE, glitchaddr, resp, Validate=False)
+        self.oa.sendMessage(CODE_WRITE, "CLOCKGLITCH_SETTINGS", resp, Validate=False)
         resp[5] = resp[5] & ~(1 << 7)
-        self.oa.sendMessage(CODE_WRITE, glitchaddr, resp, Validate=False)
+        self.oa.sendMessage(CODE_WRITE, "CLOCKGLITCH_SETTINGS", resp, Validate=False)
 
     def glitchArm(self):
         """If trigger is set to single-shot mode, this must be called before the selected trigger occurs"""
@@ -1165,14 +1207,14 @@ class ChipWhispererGlitch(object):
 
     def setGlitchClkSource(self, source):
         """Set the source of the glitched clock, either the HS1-In or the CLKGEN Module"""
-        resp = self.oa.sendMessage(CODE_READ, glitchaddr, Validate=False, maxResp=8)
+        resp = self.oa.sendMessage(CODE_READ, "CLOCKGLITCH_SETTINGS", Validate=False, maxResp=8)
         resp[7] = (resp[7] & ~self.CLKSOURCE_MASK) | source
-        self.oa.sendMessage(CODE_WRITE, glitchaddr, resp, Validate=False)
+        self.oa.sendMessage(CODE_WRITE, "CLOCKGLITCH_SETTINGS", resp, Validate=False)
         if self._is_husky:
             self.resetDCMs()
 
     def glitchClkSource(self):
-        resp = self.oa.sendMessage(CODE_READ, glitchaddr, Validate=False, maxResp=8)
+        resp = self.oa.sendMessage(CODE_READ, "CLOCKGLITCH_SETTINGS", Validate=False, maxResp=8)
         return (resp[7] & self.CLKSOURCE_MASK)
 
     def getArmTiming(self):
